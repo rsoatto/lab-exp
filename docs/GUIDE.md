@@ -51,11 +51,11 @@ project/
    ancestors/descendants (kind-filterable, with files); `lab-exp graph` dumps the whole DAG as
    JSON (`--dot` for graphviz) for arbitrary graph searches. For a HUMAN, `lab-exp dag` renders the
    whole DAG as one self-contained interactive HTML page — click a node to read its README, with
-   ancestors/descendants highlighted — which is what to produce when Renzo asks to *see* the
+   ancestors/descendants highlighted — which is what to produce when the user asks to *see* the
    lineage. Pipe it straight to a shareable URL: `lab-exp dag --out - | lab-report publish
    /dev/stdin --title "<project> — experiment DAG"`. `lab-exp dag --serve` serves it LIVE on
    localhost instead: reloads re-read the registry, and the page gains mark-superseded / undo
-   buttons that write it (same locked code path as `lab-exp supersede`) — offer this when Renzo
+   buttons that write it (same locked code path as `lab-exp supersede`) — offer this when the user
    wants to review and mark experiments interactively.
 3. **Experiments are append-only.** When a later experiment overrides an earlier one's result,
    `lab-exp supersede <old> --by <new>` — a status change (record, dir, and finding stay; the DAG
