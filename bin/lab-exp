@@ -1,0 +1,2023 @@
+#!/usr/bin/env python3
+"""lab-exp — structure a project for agentic experimentation.
+
+One shared importable package (methods/models/loops/viz) + append-only experiments/,
+each experiment a directory with README (hypothesis, method, how-to-run) + run.py + out/.
+A registry TSV is the agent-facing truth; wandb is the human layer; lab-report composes
+lib/viz renders into published pages. Stamping happens from OUTSIDE the experiment
+process, so projects never import this framework and `python run.py` always works bare.
+
+  lab-exp init [--package PKG]        # adopt in the current project root (additive)
+  lab-exp new <slug> --kind K [--tags k:v,..] [--based-on ID] [--title T]
+  lab-exp run <ID> [--gpus N] [--time T] [--partition P] [--dry-run] [-- args...]
+  lab-exp done <ID> [--status done|failed|abandoned] [--finding "..."] [--metrics k=v,..]
+  lab-exp list [--kind K] [--tag k:v] [--status S]
+  lab-exp viz <ID> [<name>]           # list / run applicable visualizers -> out/viz/
+  lab-exp serve <name> <ID...> | serve --list | serve --stop <port>
+  lab-exp index                       # regenerate <pkg>/INDEX.md (methods + visualizers)
+  lab-exp doctor                      # drift checks (warn, never block)
+  lab-exp projects                    # all lab-exp projects on this machine
+
+Per-project knobs live in .lab-exp.toml (written by init, edited by hand, never guessed).
+Registry columns: id date kind status agent host git_sha based_on tags metrics finding wandb
+"""
+import argparse
+import ast
+import contextlib
+import fcntl
+import fnmatch
+from collections import deque
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+CONFIG_NAME = ".lab-exp.toml"
+REG_COLS = ["id", "date", "kind", "status", "agent", "host", "git_sha",
+            "based_on", "tags", "metrics", "finding", "wandb", "superseded_by"]
+# superseded_by appended 2026-08: reg_read pads short rows, so old registries need no migration.
+# Machine-local state -> ~/.config/lab (NOT ~/lab, which is rsync-deployed from the laptop: a
+# registry living there gets clobbered by every deploy and leaks one machine's projects onto another).
+PROJECTS_TSV = Path.home() / ".config" / "lab" / "exp-projects.tsv"
+SERVES_TSV = Path.home() / ".config" / "lab" / "exp-serves.tsv"
+WANDB_ENV = Path.home() / ".config" / "lab" / "wandb.env"
+
+
+# ---------------------------------------------------------------- config
+
+def parse_toml(text):
+    """tomllib when available (py>=3.11), else a minimal parser for the subset
+    init writes: [a.b] sections, str/int/bool values, arrays of strings."""
+    try:
+        import tomllib
+        return tomllib.loads(text)
+    except ImportError:
+        pass
+    out, cur = {}, None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip() if not raw.strip().startswith('"') else raw.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            cur = out
+            for part in line.strip("[]").split("."):
+                cur = cur.setdefault(part.strip(), {})
+            continue
+        if "=" not in line:
+            continue
+        k, v = [x.strip() for x in line.split("=", 1)]
+        if v.startswith("["):
+            val = [x.strip().strip('"').strip("'") for x in v.strip("[]").split(",") if x.strip()]
+        elif v in ("true", "false"):
+            val = v == "true"
+        elif v.strip('"') != v or v.strip("'") != v:
+            val = v.strip('"').strip("'")
+        else:
+            try:
+                val = int(v)
+            except ValueError:
+                val = v
+        (cur if cur is not None else out)[k] = val
+    return out
+
+
+def find_root(start=None):
+    p = Path(start or os.getcwd()).resolve()
+    for d in [p] + list(p.parents):
+        if (d / CONFIG_NAME).is_file():
+            return d
+    die(f"no {CONFIG_NAME} found from {p} upward — run `lab-exp init` at the project root")
+
+
+def load_cfg(root):
+    cfg = parse_toml((root / CONFIG_NAME).read_text())
+    cfg.setdefault("project", {})
+    cfg.setdefault("paths", {})
+    cfg.setdefault("env", {})
+    cfg.setdefault("run", {})
+    cfg.setdefault("wandb", {})
+    return cfg
+
+
+def pkg_dir(root, cfg):
+    return root / cfg["project"].get("package", "lib")
+
+
+def die(msg, code=1):
+    print(f"lab-exp: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"  WARN {msg}")
+
+
+# ---------------------------------------------------------------- registry
+
+def reg_path(root):
+    return root / "experiments" / "_registry.tsv"
+
+
+def reg_read(root):
+    rows = []
+    f = reg_path(root)
+    if not f.is_file():
+        return rows
+    for line in f.read_text().splitlines()[1:]:
+        if not line.strip():
+            continue
+        vals = line.split("\t")
+        vals += [""] * (len(REG_COLS) - len(vals))
+        rows.append(dict(zip(REG_COLS, vals)))
+    return rows
+
+
+@contextlib.contextmanager
+def reg_lock(root):
+    # Serializes registry read-modify-write across concurrent lab-exp processes.
+    lock = reg_path(root).with_suffix(".tsv.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+
+
+def reg_write(root, rows):
+    f = reg_path(root)
+    # PID-unique temp: two writers racing through one fixed temp path made the
+    # loser's os.replace die with FileNotFoundError.
+    tmp = f.with_suffix(f".tsv.tmp.{os.getpid()}")
+    clean = lambda s: str(s).replace("\t", " ").replace("\n", " ")
+    try:
+        with open(tmp, "w") as fh:
+            fh.write("\t".join(REG_COLS) + "\n")
+            for r in rows:
+                fh.write("\t".join(clean(r.get(c, "")) for c in REG_COLS) + "\n")
+        os.replace(tmp, f)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def reg_upsert(root, row):
+    with reg_lock(root):
+        rows = reg_read(root)
+        for i, r in enumerate(rows):
+            if r["id"] == row["id"]:
+                rows[i] = {**r, **{k: v for k, v in row.items() if v != ""}}
+                break
+        else:
+            rows.append({c: row.get(c, "") for c in REG_COLS})
+        reg_write(root, rows)
+
+
+# ---------------------------------------------------------------- experiments
+
+def exp_dir(root, eid):
+    d = root / "experiments" / eid
+    if not d.is_dir():
+        # allow slug-only reference if unambiguous
+        hits = [p for p in (root / "experiments").iterdir()
+                if p.is_dir() and not p.name.startswith("_") and p.name.endswith("-" + eid)]
+        if len(hits) == 1:
+            return hits[0]
+        die(f"no experiment '{eid}' (and no unique slug match)")
+    return d
+
+
+def read_front(readme):
+    """Parse the --- frontmatter block of an experiment README into a dict."""
+    meta = {}
+    if not readme.is_file():
+        return meta
+    lines = readme.read_text().splitlines()
+    if not lines or lines[0].strip() != "---":
+        return meta
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip()
+    return meta
+
+
+def split_list(s):
+    return [x.strip() for x in re.split(r"[,\s]+", (s or "").strip().strip("[]"))
+            if x.strip() and x.strip() != "none"]
+
+
+def tags_dict(tag_list):
+    d = {}
+    for t in tag_list:
+        if ":" in t:
+            k, v = t.split(":", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def graph_maps(root):
+    """(rows_by_id, parents, children) from the registry's based_on edges. based_on is a comma-list,
+    so an experiment can have MULTIPLE parents -> the lineage is a DAG, not a chain. Built in code
+    on each call (O(N) over the registry, instant at any real scale) — the whole point is that the
+    CLI walks the graph so the AGENT never spends turns traversing it. Dangling parents (id not in
+    the registry) are dropped from the edge set. Persistent store = the registry itself (one source
+    of truth, append-only), so there is no second graph file to drift."""
+    rows = {r["id"]: r for r in reg_read(root)}
+    parents, children = {}, {}
+    for eid, r in rows.items():
+        ps = [p for p in split_list(r.get("based_on", "")) if p in rows]
+        parents[eid] = ps
+        for pp in ps:
+            children.setdefault(pp, []).append(eid)
+    return rows, parents, children
+
+
+def _bfs(adj, eid):
+    """[(node, depth), ...] reachable from eid via adjacency `adj`, nearest first, deduped. In a DAG
+    a node reachable by several paths is reported once, at its shortest depth."""
+    out, seen, q = [], {eid}, deque((c, 1) for c in adj.get(eid, []))
+    while q:
+        n, d = q.popleft()
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append((n, d))
+        for nxt in adj.get(n, []):
+            if nxt not in seen:
+                q.append((nxt, d + 1))
+    return out
+
+
+def ancestors(root, eid, maps=None):
+    _rows, parents, _children = maps or graph_maps(root)
+    return _bfs(parents, eid)
+
+
+def descendants(root, eid, maps=None):
+    _rows, _parents, children = maps or graph_maps(root)
+    return _bfs(children, eid)
+
+
+def lineage_root(root, eid):
+    """Deterministic single root id for wandb grouping: the oldest parentless ancestor (ids sort
+    chronologically as YYYYMMDD-slug, so min = oldest). eid itself if it has no ancestors. For a
+    single-parent chain this is exactly the old top-of-chain, so wandb groups don't shift."""
+    _rows, parents, _children = graph_maps(root)
+    reach = [eid] + [n for n, _d in _bfs(parents, eid)]
+    roots = [n for n in reach if not parents.get(n)]
+    return min(roots) if roots else eid
+
+
+def _git(root, *a):
+    r = subprocess.run(["git", "-C", str(root)] + list(a), capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def git_info(root, cfg=None):
+    """(sha, dirty, offenders). dirty honors [run] dirty_ok: paths matching those globs
+    ("dir/" = subtree) don't count, so migration-era repos full of declared scratch read
+    "clean modulo scratch". offenders is the porcelain lines that DID count — the caller reports
+    them, because "your tree is dirty" without naming the files is unactionable."""
+    sha = _git(root, "rev-parse", "--short", "HEAD").strip()
+    # lab-exp's OWN bookkeeping never counts. Every run appends to the registry, rewrites INDEX.md,
+    # and fills out/ — so without this the first run dirties the tree and the SECOND one is refused
+    # by the framework's own writes. What must be clean is the CODE that produced the result.
+    # _registry.tsv* covers the registry, its .lock, and reg_write's pid-suffixed temps -- one
+    # glob, so new framework-owned registry files can't dirty the tree by omission.
+    allow = ["experiments/_registry.tsv*", "INDEX.md", "experiments/*/out/*", "experiments/*/out"]
+    allow += (cfg or {}).get("run", {}).get("dirty_ok", []) or []
+    offenders = []
+    for line in _git(root, "status", "--porcelain").splitlines():
+        path = line[3:].strip().strip('"')
+        ok = any(path.startswith(pat) if pat.endswith("/") else
+                 fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(path.rsplit("/", 1)[-1], pat)
+                 for pat in allow)
+        if not ok:
+            offenders.append(line.rstrip())
+    return sha or "nogit", bool(offenders), offenders
+
+
+def _module_candidates(root, mod, from_file, level):
+    """Relative paths a module name could resolve to INSIDE the repo. level>0 = a relative import
+    (`from . import x`), resolved against the importing file's package rather than the root."""
+    base = Path("")
+    if level:
+        base = from_file.parent
+        for _ in range(level - 1):
+            base = base.parent
+    parts = mod.split(".") if mod else []
+    stem = base.joinpath(*parts)
+    cands = [stem.with_suffix(".py"), stem / "__init__.py"]
+    # Importing pkg.sub.mod also EXECUTES pkg/__init__.py and pkg/sub/__init__.py.
+    for i in range(1, len(parts)):
+        cands.append(base.joinpath(*parts[:i]) / "__init__.py")
+    return cands
+
+
+def import_closure(root, entry):
+    """Every in-repo .py file reachable from `entry` by following imports, transitively.
+
+    Static (AST) on purpose: it runs BEFORE launch, so an unreproducible run can be refused rather
+    than discovered afterwards in an append-only record. The cost is that it cannot see dynamic
+    imports (importlib.import_module on a computed name, plugin registries) — this is a floor on
+    what the run needs, not a proof. Paths are relative to root; files outside the repo (site
+    packages, stdlib) are ignored, since git can't track those anyway."""
+    seen, queue, found = set(), [entry], set()
+    probed = {}          # candidate relpath -> is_file(); an NFS stat per DISTINCT path, not per import
+    def probe(cand):
+        k = str(cand)
+        if k not in probed:
+            probed[k] = (root / cand).is_file()
+        return probed[k]
+    while queue:
+        rel = queue.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        f = root / rel
+        if not f.is_file():
+            continue
+        found.add(rel)
+        try:
+            tree = ast.parse(f.read_text())
+        except (SyntaxError, UnicodeDecodeError):
+            continue    # unparseable code is the run's problem to report, not the tracker's
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Import):
+                targets = [(n.name, 0) for n in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                # `from pkg.mod import name` — `name` may itself be a submodule, so try both.
+                targets = [(node.module or "", node.level)]
+                targets += [((node.module + "." + n.name) if node.module else n.name, node.level)
+                            for n in node.names]
+            for mod, level in targets:
+                for cand in _module_candidates(root, mod, rel, level):
+                    if probe(cand):
+                        queue.append(cand)
+    return found
+
+
+def untracked_imports(root, entry):
+    """In-repo files the run imports that git is NOT tracking — the silent reproducibility hole.
+
+    A .gitignore'd module is invisible to `git status --porcelain`, so the tree reads CLEAN, the
+    dirty check passes, and the recorded SHA omits code the run actually executed. That is strictly
+    worse than the untracked-and-dirty case, which at least produces a warning."""
+    tracked = set(_git(root, "ls-files", "-z").split("\0"))
+    return sorted(str(p) for p in import_closure(root, entry) if str(p) not in tracked)
+
+
+def archive_untracked(root, outdir, paths):
+    """Copy untracked imported code into out/untracked-code/, preserving relative layout, so the
+    --allow-dirty escape hatch stays reconstructible instead of merely permitted."""
+    dest_base = outdir / "untracked-code"
+    saved = []
+    for rel in paths:
+        src = root / rel
+        if not src.is_file():
+            continue
+        dest = dest_base / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        saved.append(rel)
+    return saved
+
+
+def write_dirty_patch(root, outdir, offenders):
+    """Make a dirty run reproducible anyway: SHA + patch reconstructs the exact tree.
+
+    Returns (patch_relpath_or_empty, untracked_list). `git diff HEAD` covers TRACKED modifications
+    only — an untracked new module the run imports is invisible to it, and that is the dangerous
+    case, so the names are returned for run-meta rather than silently omitted."""
+    patch = _git(root, "diff", "HEAD")
+    rel = ""
+    if patch.strip():
+        (outdir / "dirty.patch").write_text(patch)
+        rel = "out/dirty.patch"
+    untracked = [ln[3:].strip().strip('"') for ln in offenders if ln.startswith("??")]
+    return rel, untracked
+
+
+def agent_name():
+    return os.environ.get("LAB_EXP_AGENT") or os.environ.get("USER", "unknown")
+
+
+# ---------------------------------------------------------------- templates
+
+TOML_TEMPLATE = """\
+# lab-exp project config — written by `lab-exp init`, edit by hand. See `lab-exp --help`.
+[project]
+name = "{name}"
+package = "{package}"          # the shared importable package (methods/models/loops/viz)
+site = "{site}"                # cw | exxact | mac — informational; registries are per-site
+kinds = ["training", "analysis"]   # allowed experiment kinds; `new --kind` must be one of these
+tag_keys = []                  # structured tag keys usable in viz MATCH, e.g. ["arch", "objective"]
+
+[paths]
+# data = ["/mnt/data/..."]     # where the datasets live (informational, for READMEs/doctor)
+scratch = "{scratch}"          # big/ephemeral outputs + WANDB_DIR live here, not in git
+# cache = "/path/to/cache"     # DURABLE COMPUTED artifacts shared across experiments (feature
+                               #   stores, frozen judge caches, embeddings): not raw data, not
+                               #   scratch, not any one experiment's out/. Exported to runs as
+                               #   $LAB_EXP_CACHE; each top-level subdir should carry a
+                               #   PROVENANCE.md naming the experiment that generated it.
+
+[env]
+activate = "{activate}"        # shell line to enter the project env, e.g. "source .venv/bin/activate"
+
+[run]
+launcher = "{launcher}"        # local | slurm  (slurm submits via lab-slurm on the CW cell)
+# dirty_ok = ["scratch/", "*.log"]  # untracked/modified paths that do NOT count as a dirty tree
+                               #   (globs; "dir/" matches the subtree) — for migration-era repos
+# require_clean = false        # default true: `lab-exp run` REFUSES on a dirty tree, because the
+                               #   recorded SHA would not reproduce the run and the experiment
+                               #   record is append-only. Per-run escape hatch: `--allow-dirty`
+                               #   (saves out/dirty.patch, so SHA+patch still reproduces it).
+                               #   Set false only for a repo mid-migration, where the mess is
+                               #   larger than dirty_ok can sensibly enumerate.
+[run.slurm]
+partition = "debug"
+gpus = 1
+time = "2:00:00"
+
+[wandb]
+enabled = {wandb_enabled}
+entity = ""                    # wandb entity; project defaults to [project].name
+# project = ""                 # set if the wandb project differs from [project].name
+"""
+
+README_TEMPLATE = """\
+---
+id: {id}
+title: {title}
+kind: {kind}
+tags: {tags}
+based_on: {based_on}
+produces: metrics.json
+---
+
+# {title}
+
+## Hypothesis
+<!-- 1-2 sentences: what question does this answer, and what do you expect? -->
+
+## Method
+<!-- What this run does, and how it differs from based_on. Reference {pkg}/ methods by name;
+     check {pkg}/INDEX.md BEFORE writing anything new. -->
+
+## How to run
+
+    lab-exp run {id}
+
+<!-- Document any extra args and what they mean. This section alone must suffice to reproduce. -->
+
+## Result
+<!-- Filled when done (via `lab-exp done`): status, key metrics, finding, wandb link. -->
+"""
+
+RUN_GENERIC = '''\
+"""{id} — see README.md in this directory.
+
+Runs bare (`python run.py`) or stamped+registered via `lab-exp run {id}`.
+Import shared code from the project package — check {pkg}/INDEX.md before writing new methods.
+"""
+import sys
+from pathlib import Path
+
+EXP = Path(__file__).resolve().parent
+OUT = EXP / "out"
+ROOT = EXP.parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+def main():
+    OUT.mkdir(exist_ok=True)
+    # TODO: implement the experiment. Write key scalars to OUT/"metrics.json".
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+RUN_TRAINING = '''\
+"""{id} — see README.md in this directory.
+
+Runs bare (`python run.py`) or stamped+registered via `lab-exp run {id}`.
+Import shared code from the project package — check {pkg}/INDEX.md before writing new methods.
+"""
+import json
+import sys
+from pathlib import Path
+
+EXP = Path(__file__).resolve().parent
+OUT = EXP / "out"
+ROOT = EXP.parent.parent
+sys.path.insert(0, str(ROOT))
+
+
+def main():
+    OUT.mkdir(exist_ok=True)
+    try:  # wandb is configured entirely by `lab-exp run` env vars; bare init is correct
+        import wandb
+        wandb.init()
+    except Exception:
+        wandb = None
+
+    # TODO: build model/data/loop from the shared package; log per-step to wandb,
+    # and write final scalars for the registry + visualizers:
+    metrics = {{}}
+    (OUT / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+RUN_ANALYSIS = '''\
+"""{id} — see README.md in this directory.
+
+Post-hoc analysis over prior experiment(s). Runs bare or via `lab-exp run {id}`.
+"""
+import json
+import sys
+from pathlib import Path
+
+EXP = Path(__file__).resolve().parent
+OUT = EXP / "out"
+ROOT = EXP.parent.parent
+sys.path.insert(0, str(ROOT))
+
+SOURCE = ROOT / "experiments" / "{primary_parent}"   # first parent; see README based_on for all
+
+
+def main():
+    OUT.mkdir(exist_ok=True)
+    # TODO: load SOURCE/out artifacts, analyze, write results to OUT.
+    (OUT / "metrics.json").write_text(json.dumps({{}}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+VIZ_EXAMPLE = '''\
+"""Example visualizer — copy this shape for new ones; `lab-exp index` harvests it.
+
+A visualizer declares what it needs; lab-exp offers it only where applicable:
+  REQUIRES — filenames (globs ok) that must exist in the experiment's out/
+  MATCH    — structured-tag constraints, e.g. {"arch": "hnet"} or {"arch": ["a", "b"]}
+  KIND     — restrict to an experiment kind (str or list); omit/None = any
+
+Implement render() (static: write .vl.json / .png / .html into out_dir, return paths)
+and/or serve() (interactive: host an app on `port`, blocking; marimo is the house
+convention but anything that binds the port is legal). render() feeds lab-report pages;
+serve() is reached via `lab-exp serve` + an ssh tunnel.
+"""
+from pathlib import Path
+
+REQUIRES = ["metrics.json"]
+MATCH = {}
+KIND = None
+
+
+def render(exp_dir: Path, out_dir: Path) -> list:
+    import json
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metrics = json.loads((exp_dir / "out" / "metrics.json").read_text())
+    if isinstance(metrics, list):  # training-history style: chart the last record
+        metrics = metrics[-1] if metrics else {}
+    spec = {  # Vega-Lite: drops straight into lab-report pages
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "data": {"values": [{"metric": k, "value": v} for k, v in metrics.items()
+                            if isinstance(v, (int, float))]},
+        "mark": "bar",
+        "encoding": {"x": {"field": "metric", "type": "nominal"},
+                     "y": {"field": "value", "type": "quantitative"}},
+    }
+    p = out_dir / "metrics_bar.vl.json"
+    p.write_text(json.dumps(spec, indent=2))
+    return [p]
+'''
+
+TEMPLATES = {"training": RUN_TRAINING, "analysis": RUN_ANALYSIS}
+
+
+# ---------------------------------------------------------------- init
+
+def cmd_init(a):
+    root = Path(a.root or os.getcwd()).resolve()
+    if (root / CONFIG_NAME).exists():
+        die(f"{root / CONFIG_NAME} already exists")
+    # package: explicit, else unique dir with __init__.py, else create lib/
+    pkg = a.package
+    if not pkg:
+        cands = [d.name for d in root.iterdir() if d.is_dir()
+                 and (d / "__init__.py").is_file() and not d.name.startswith((".", "_"))]
+        if len(cands) == 1:
+            pkg = cands[0]
+        elif len(cands) > 1:
+            die(f"multiple packages found ({', '.join(cands)}) — pass --package")
+        else:
+            pkg = "lib"
+            (root / pkg).mkdir(exist_ok=True)
+            (root / pkg / "__init__.py").touch()
+    host = socket.gethostname()
+    site = a.site or ("cw" if Path("/mnt/home").is_dir() else
+                      "exxact" if Path("/local_home").is_dir() else "mac")
+    scratch = {"cw": f"/mnt/data/rsoatto/scratch/{root.name}",
+               "exxact": f"/var/tmp/rsoatto/scratch/{root.name}"}.get(site, str(root / "scratch"))
+    (root / CONFIG_NAME).write_text(TOML_TEMPLATE.format(
+        name=root.name, package=pkg, site=site, scratch=scratch,
+        activate=a.activate or "", launcher="slurm" if site == "cw" else "local",
+        wandb_enabled="true" if a.wandb else "false"))
+    exps = root / "experiments"
+    exps.mkdir(exist_ok=True)
+    if not reg_path(root).exists():
+        reg_write(root, [])
+    (exps / "_templates").mkdir(exist_ok=True)
+    vz = root / pkg / "viz"
+    vz.mkdir(exist_ok=True)
+    (vz / "__init__.py").touch()
+    ex = vz / "metrics_bar.py"
+    if not ex.exists():
+        ex.write_text(VIZ_EXAMPLE)
+    PROJECTS_TSV.parent.mkdir(parents=True, exist_ok=True)
+    known = PROJECTS_TSV.read_text() if PROJECTS_TSV.exists() else ""
+    if str(root) not in known:
+        with open(PROJECTS_TSV, "a") as fh:
+            fh.write(f"{root.name}\t{root}\t{site}\t{host}\t{date.today()}\n")
+    cmd_index(argparse.Namespace(root=str(root)))
+    print(f"initialized lab-exp in {root} (package={pkg}, site={site})")
+    print(f"  edit {CONFIG_NAME} (scratch, env.activate, wandb, run.slurm), then: lab-exp new <slug> --kind <k>")
+
+
+# ---------------------------------------------------------------- new
+
+def cmd_new(a):
+    root = find_root(a.root)
+    cfg = load_cfg(root)
+    kinds = cfg["project"].get("kinds", ["training", "analysis"])
+    if a.kind not in kinds:
+        die(f"kind '{a.kind}' not in project kinds {kinds} — add it to {CONFIG_NAME} if intended")
+    tag_keys = cfg["project"].get("tag_keys", [])
+    tags = split_list(a.tags or "")
+    for k in tags_dict(tags):
+        if tag_keys and k not in tag_keys:
+            warn(f"tag key '{k}' not in declared tag_keys {tag_keys} (typo? or add it to {CONFIG_NAME})")
+    slug = re.sub(r"[^a-z0-9-]+", "-", a.slug.lower()).strip("-")
+    eid = f"{date.today():%Y%m%d}-{slug}"
+    d = root / "experiments" / eid
+    if d.exists():
+        die(f"{d} already exists (experiments are append-only — make a new one)")
+    if a.based_on:  # comma-separated -> multiple parents (a DAG); validate + resolve each
+        a.based_on = ",".join(exp_dir(root, x).name for x in split_list(a.based_on))
+    d.mkdir(parents=True)
+    (d / "out").mkdir()
+    pkg = cfg["project"].get("package", "lib")
+    title = a.title or slug.replace("-", " ")
+    subs = dict(id=eid, title=title, kind=a.kind, tags=", ".join(tags) or "none",
+                based_on=(a.based_on or "none").replace(",", ", "),
+                primary_parent=(split_list(a.based_on)[:1] or [""])[0], pkg=pkg)
+    # per-project template dir wins over the built-ins
+    tdir = root / "experiments" / "_templates" / a.kind
+    if (tdir / "README.md").is_file():
+        readme = (tdir / "README.md").read_text()
+        for k, v in subs.items():
+            readme = readme.replace("{{" + k.upper() + "}}", str(v))
+    else:
+        readme = README_TEMPLATE.format(**subs)
+    (d / "README.md").write_text(readme)
+    if (tdir / "run.py").is_file():
+        runpy = (tdir / "run.py").read_text()
+        for k, v in subs.items():
+            runpy = runpy.replace("{{" + k.upper() + "}}", str(v))
+    else:
+        runpy = TEMPLATES.get(a.kind, RUN_GENERIC).format(**subs)
+    (d / "run.py").write_text(runpy)
+    reg_upsert(root, dict(id=eid, date=str(date.today()), kind=a.kind, status="planned",
+                          agent=agent_name(), host=socket.gethostname().split(".")[0],
+                          based_on=a.based_on or "", tags=",".join(tags)))
+    print(f"created experiments/{eid}/  (kind={a.kind})")
+    print(f"  1. write Hypothesis + Method in its README.md   2. implement run.py   3. lab-exp run {eid}")
+    if a.based_on:
+        anc = ancestors(root, eid)
+        dirs = ", ".join(f"experiments/{n}/" for n, _d in anc) or "(parents not in registry)"
+        print(f"  BEFORE writing helpers: check {pkg}/INDEX.md, then grep the ancestor experiments "
+              f"for reusable code — {dirs}  (or: lab-exp lineage {eid}). Reuse by PROMOTING to "
+              f"{pkg}/ (never import experiment->experiment).")
+
+
+# ---------------------------------------------------------------- run
+
+def wandb_env(root, cfg, eid, meta):
+    env = {}
+    w = cfg.get("wandb", {})
+    if not w.get("enabled"):
+        return env, ""
+    env["WANDB_PROJECT"] = w.get("project") or cfg["project"].get("name", root.name)
+    if w.get("entity"):
+        env["WANDB_ENTITY"] = w["entity"]
+    env["WANDB_NAME"] = eid
+    env["WANDB_RUN_ID"] = re.sub(r"[^a-z0-9-]", "-", eid.lower())[:64]
+    env["WANDB_RESUME"] = "allow"
+    env["WANDB_RUN_GROUP"] = lineage_root(root, eid)
+    tags = split_list(meta.get("tags", "")) + [f"kind:{meta.get('kind', '')}"]
+    env["WANDB_TAGS"] = ",".join(t for t in tags if t)
+    scratch = cfg["paths"].get("scratch", "")
+    if scratch:
+        Path(scratch).mkdir(parents=True, exist_ok=True)
+        env["WANDB_DIR"] = scratch
+    # auth: pass through whatever exists; drop-in env file is sourced in-shell (never printed)
+    src = ""
+    if WANDB_ENV.is_file():
+        src = f"set -a; . {WANDB_ENV}; set +a; "
+    else:
+        netrc = Path.home() / ".netrc"
+        has_auth = os.environ.get("WANDB_API_KEY") or (
+            netrc.is_file() and "api.wandb.ai" in netrc.read_text())
+        if not has_auth and not os.environ.get("WANDB_MODE"):
+            env["WANDB_MODE"] = "offline"
+            warn("no wandb auth found -> WANDB_MODE=offline (drop a key in "
+                 f"{WANDB_ENV} to go online)")
+    return env, src
+
+
+def cmd_run(a):
+    root = find_root(a.root)
+    cfg = load_cfg(root)
+    d = exp_dir(root, a.id)
+    eid = d.name
+    meta = read_front(d / "README.md")
+    (d / "out").mkdir(exist_ok=True)
+    sha, dirty, offenders = git_info(root, cfg)
+    # A dirty tree stamps a SHA that does NOT reproduce the run, into an APPEND-ONLY record that
+    # can't be corrected later. This used to be a warning; warnings are useless here because the
+    # caller is usually an autonomous agent that never re-reads its own stderr. Refuse instead, and
+    # make the escape hatch honest rather than merely permitted: --allow-dirty saves the diff, so
+    # SHA + patch still reconstructs the tree.
+    require_clean = cfg.get("run", {}).get("require_clean", True)
+    if dirty and require_clean and not a.allow_dirty:
+        shown = "\n".join("    " + o for o in offenders[:12])
+        more = f"\n    … and {len(offenders) - 12} more" if len(offenders) > 12 else ""
+        die("git tree is DIRTY — refusing to stamp a SHA that will not reproduce this run "
+            f"(the experiment record is append-only, so this can't be fixed afterwards):\n{shown}{more}\n"
+            "  commit first, or:\n"
+            "    --allow-dirty            run anyway, saving the diff to out/dirty.patch\n"
+            "    [run] dirty_ok = [...]   declare paths that never count (scratch, logs)\n"
+            "    [run] require_clean = false   opt this project out entirely (migration-era repos)")
+    # The dirty check above sees only what `git status` sees — a .gitignore'd module the run
+    # imports leaves the tree reading CLEAN while the recorded SHA omits code the run executed.
+    # Walk the entry point's static import closure and require every in-repo file in it to be
+    # TRACKED. dirty_ok deliberately does not excuse these: declaring scratch/ ignorable is fine,
+    # importing code from it is not.
+    missing_code = untracked_imports(root, Path(f"experiments/{eid}/run.py"))
+    if missing_code and require_clean and not a.allow_dirty:
+        shown = "\n".join("    " + p for p in missing_code[:12])
+        die(f"run.py imports {len(missing_code)} file(s) git is NOT tracking — the stamped SHA "
+            f"would silently omit code this run executes:\n{shown}\n"
+            "  `git add` them (check .gitignore — an ignored module still reads as a clean tree), or:\n"
+            "    --allow-dirty            run anyway, archiving them to out/untracked-code/\n"
+            "    [run] require_clean = false   opt this project out entirely")
+    dirty_patch, dirty_untracked = "", []
+    if missing_code:
+        saved = archive_untracked(root, d / "out", missing_code)
+        warn(f"{len(missing_code)} UNTRACKED imported file(s) — archived to out/untracked-code/: "
+             + ", ".join(saved[:5]) + (" …" if len(saved) > 5 else ""))
+    if dirty:
+        dirty_patch, dirty_untracked = write_dirty_patch(root, d / "out", offenders)
+        warn(f"running from a DIRTY tree ({len(offenders)} path(s)); "
+             + (f"tracked changes saved to {dirty_patch}" if dirty_patch else "no tracked diff to save"))
+        if dirty_untracked:
+            warn(f"{len(dirty_untracked)} UNTRACKED path(s) are NOT in the patch — "
+                 f"SHA+patch will not fully reproduce this run: {', '.join(dirty_untracked[:5])}"
+                 + (" …" if len(dirty_untracked) > 5 else ""))
+    env, wandb_src = wandb_env(root, cfg, eid, meta)
+    # No-import-coupling contract: experiment code reads plain env vars, never the framework.
+    env["LAB_EXP_ID"] = eid
+    env["LAB_EXP_DIR"] = str(d)
+    cache_root = cfg["paths"].get("cache", "")
+    if cache_root:
+        Path(cache_root).mkdir(parents=True, exist_ok=True)
+        env["LAB_EXP_CACHE"] = cache_root   # durable shared computed artifacts — ONE relocation knob
+    extra = a.args or []
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    run_meta = dict(
+        id=eid, command=f"python experiments/{eid}/run.py" + ("".join(" " + x for x in extra)),
+        git_sha=sha, git_dirty=dirty,
+        # Present only when dirty, so a clean run's meta stays uncluttered. dirty_untracked is the
+        # honest caveat: those files are in NEITHER the SHA nor the patch.
+        **({"dirty_patch": dirty_patch, "dirty_untracked": dirty_untracked} if dirty else {}),
+        **({"untracked_imports": missing_code} if missing_code else {}),
+        launcher=cfg["run"].get("launcher", "local"),
+        submitted_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        host=socket.gethostname().split(".")[0], agent=agent_name(),
+        cache_root=cfg["paths"].get("cache", ""),
+        activate=cfg["env"].get("activate", ""), python=sys.version.split()[0],
+        wandb={k: v for k, v in env.items() if not k.endswith("KEY")},
+    )
+    (d / "out" / "run-meta.json").write_text(json.dumps(run_meta, indent=2))
+    activate = cfg["env"].get("activate", "")
+    exports = "".join(f"export {k}={sh_q(v)}; " for k, v in env.items())
+    inner = (f"cd {sh_q(str(root))} && {wandb_src}{exports}"
+             + (f"{activate} && " if activate else "")
+             + f"lab-exp _stamp-hw {sh_q(str(d))} ; "
+             + f"set -o pipefail; python experiments/{eid}/run.py"
+             + "".join(" " + sh_q(x) for x in extra)
+             + f" 2>&1 | tee -a {sh_q(str(d / 'out' / 'run.log'))}")
+    launcher = cfg["run"].get("launcher", "local")
+    if a.dry_run:
+        print(f"[dry-run] launcher={launcher}\n{inner}")
+        return
+    reg_upsert(root, dict(id=eid, date=str(date.today()), kind=meta.get("kind", ""),
+                          status="running", agent=agent_name(), git_sha=sha + ("*" if dirty else ""),
+                          host=socket.gethostname().split(".")[0],
+                          based_on=meta.get("based_on", "").replace("none", ""),
+                          tags=meta.get("tags", "").replace("none", "").replace(" ", ""),
+                          wandb=wandb_url(cfg, env)))
+    if launcher == "slurm":
+        s = cfg["run"].get("slurm", {})
+        cmd = ["lab-slurm", "submit", "-p", str(a.partition or s.get("partition", "debug")),
+               "-g", str(a.gpus or s.get("gpus", 1)), "-t", str(a.time or s.get("time", "2:00:00")),
+               "-J", eid, "--cmd", inner]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError:
+            reg_upsert(root, dict(id=eid, status="planned"))
+            die("lab-slurm not found on this host — launcher=slurm only works on the CW login node "
+                "(set [run] launcher=\"local\" here, or run this on the node)")
+        jid = r.stdout.strip()
+        if r.returncode != 0 or not jid:
+            reg_upsert(root, dict(id=eid, status="failed"))
+            die(f"lab-slurm submit failed: {r.stderr.strip() or r.stdout.strip()}")
+        run_meta["slurm_job_id"] = jid
+        (d / "out" / "run-meta.json").write_text(json.dumps(run_meta, indent=2))
+        reg_upsert(root, dict(id=eid, host=f"slurm:{jid}"))
+        print(f"submitted {eid} as SLURM job {jid}  (lab-slurm logs {jid} -f)")
+        print("  REMINDER: arm a watchdog to check this job — do not fire-and-forget.")
+    else:
+        print(f"running {eid} locally (log: experiments/{eid}/out/run.log)")
+        rc = subprocess.call(["bash", "-c", inner])
+        reg_upsert(root, dict(id=eid, status="ran" if rc == 0 else "failed"))
+        print(f"{'OK' if rc == 0 else 'FAILED rc=' + str(rc)} — record the finding: lab-exp done {eid} --finding '...'"
+              if rc == 0 else f"FAILED rc={rc} — see out/run.log; registry marked failed")
+        sys.exit(rc)
+
+
+def sh_q(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def wandb_url(cfg, env):
+    if "WANDB_RUN_ID" not in env or env.get("WANDB_MODE") == "offline":
+        return ""
+    ent = env.get("WANDB_ENTITY", "")
+    proj = env.get("WANDB_PROJECT", "")
+    return f"https://wandb.ai/{ent}/{proj}/runs/{env['WANDB_RUN_ID']}" if ent and proj else ""
+
+
+def cmd_stamp_hw(a):
+    """Internal: runs on the execution host just before run.py; appends hardware to run-meta."""
+    d = Path(a.expdir)
+    f = d / "out" / "run-meta.json"
+    meta = json.loads(f.read_text()) if f.is_file() else {}
+    hw = dict(exec_host=socket.gethostname().split(".")[0],
+              started_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              slurm_job_id=os.environ.get("SLURM_JOB_ID", ""),
+              cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        r = subprocess.run([smi, "--query-gpu=name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            hw["gpus"] = [x.strip() for x in r.stdout.strip().splitlines()]
+    meta["hardware"] = hw
+    f.write_text(json.dumps(meta, indent=2))
+
+
+# ---------------------------------------------------------------- done
+
+def append_result_note(readme, note):
+    """Append `note` under the README's ## Result section (creating it if absent) -- the one
+    place the Result-section convention lives; cmd_done and cmd_supersede both stamp through it."""
+    if not readme.is_file():
+        return
+    txt = readme.read_text()
+    txt = (txt.replace("## Result", "## Result" + note, 1) if "## Result" in txt
+           else txt + "\n## Result\n" + note)
+    readme.write_text(txt)
+
+
+def cmd_done(a):
+    root = find_root(a.root)
+    d = exp_dir(root, a.id)
+    eid = d.name
+    metrics = ",".join(split_list(a.metrics or ""))
+    row = dict(id=eid, status=a.status, finding=(a.finding or "").strip(), metrics=metrics)
+    reg_upsert(root, row)
+    # append to the README Result section
+    if a.finding:
+        append_result_note(d / "README.md",
+                           f"\n**{a.status}** ({date.today()}): {a.finding}"
+                           + (f"  \nmetrics: {metrics}" if metrics else "") + "\n")
+    # check declared produces (same nested-aware matching as viz REQUIRES)
+    produced = out_artifacts(d / "out")
+    missing = [p for p in split_list(read_front(d / "README.md").get("produces", ""))
+               if not artifact_match(p, produced)]
+    if missing and a.status == "done":
+        warn(f"declared produces missing from out/: {missing}")
+    print(f"recorded {eid}: {a.status}" + (f' — "{a.finding}"' if a.finding else ""))
+
+
+
+
+def do_supersede(root, old, by, why):
+    """Registry + README effects of superseding; shared by the CLI and the live dag server.
+    Raises (never die()s) so a serving process survives a bad request."""
+    eid = exp_dir(root, old).name
+    succ = ""
+    if by:
+        succ = exp_dir(root, by).name        # validates the successor exists
+        if succ == eid:
+            raise ValueError("an experiment cannot supersede itself")
+    reg_upsert(root, dict(id=eid, status="superseded", superseded_by=succ))
+    append_result_note(exp_dir(root, eid) / "README.md",
+                       ("\n**superseded** (" + str(date.today()) + ")"
+                        + (" by " + succ if succ else "")
+                        + (": " + why if why else "") + "\n"))
+    return succ
+
+
+def do_unsupersede(root, old):
+    eid = exp_dir(root, old).name
+    with reg_lock(root):
+        rows = reg_read(root)
+        for r in rows:
+            if r["id"] == eid:
+                r["status"], r["superseded_by"] = "done", ""
+        reg_write(root, rows)
+
+
+def do_set_important(root, old, on):
+    """Add/remove the plain 'important' token in the tags column. Locked RMW because removal can
+    leave tags empty, which reg_upsert's skip-empty merge could not write back."""
+    eid = exp_dir(root, old).name
+    with reg_lock(root):
+        rows = reg_read(root)
+        for r in rows:
+            if r["id"] == eid:
+                toks = [t for t in split_list(r.get("tags", "")) if t != "important"]
+                if on:
+                    toks.append("important")
+                r["tags"] = ",".join(toks)
+        reg_write(root, rows)
+
+
+def cmd_important(a):
+    root = find_root(a.root)
+    do_set_important(root, a.id, not a.undo)
+    print(f"{exp_dir(root, a.id).name}: {'marked' if not a.undo else 'unmarked'} important")
+
+
+def cmd_supersede(a):
+    """Mark a finished experiment as overridden by a later one. A STATUS change, not a deletion:
+    the record, dir, and finding stay (append-only holds); the DAG hides superseded nodes by
+    default and doctor stops nagging about them."""
+    root = find_root(a.root)
+    eid = exp_dir(root, a.id).name
+    if a.undo:
+        do_unsupersede(root, eid)
+        print(f"{eid}: restored to done")
+        return
+    succ = do_supersede(root, eid, a.by, a.why)
+    print(f"superseded {eid}" + (f" -> {succ}" if succ else ""))
+
+
+# ---------------------------------------------------------------- adopt
+
+def cmd_adopt(a):
+    """Materialize existing artifacts (scratch outputs, legacy results) into an experiment's out/
+    with provenance — the sanctioned form of what backfills/cutovers otherwise hand-roll with ln.
+    Symlinks by default (big files stay where they are; provenance visible); --copy for durable
+    ingestion of small artifacts. Records every adoption in out/run-meta.json, which also means
+    doctor sees an explanation for out/ contents instead of flagging an unstamped run."""
+    root = find_root(a.root)
+    d = exp_dir(root, a.id)
+    out = d / "out"
+    dest_base = out / a.into if a.into else out
+    dest_base.mkdir(parents=True, exist_ok=True)
+    metaf = out / "run-meta.json"
+    meta = json.loads(metaf.read_text()) if metaf.is_file() else {"id": d.name}
+    adopted = meta.setdefault("adopted", [])
+    for s in a.paths:
+        src = Path(s).expanduser().resolve()
+        if not src.exists():
+            die(f"{src} does not exist")
+        dest = dest_base / src.name
+        if dest.exists() or dest.is_symlink():
+            die(f"{dest} already exists — remove it first if you mean to replace it")
+        if a.copy:
+            shutil.copytree(src, dest) if src.is_dir() else shutil.copy2(src, dest)
+        else:
+            dest.symlink_to(src)
+        adopted.append(dict(src=str(src), dest=str(dest.relative_to(d)),
+                            mode="copy" if a.copy else "symlink",
+                            at=datetime.now(timezone.utc).isoformat(timespec="seconds")))
+        print(f"adopted {src} -> {dest.relative_to(d)} ({'copy' if a.copy else 'symlink'})")
+    metaf.write_text(json.dumps(meta, indent=2))
+    if not a.copy:
+        print("  note: symlinked — if the source (e.g. scratch) is cleaned, these dangle; use --copy for small durable artifacts")
+
+
+# ---------------------------------------------------------------- list / projects
+
+def _content_hash(path):
+    """(kind, hexdigest). Files: sha256 of bytes. Dirs: sha256 over the sorted (relpath, size)
+    manifest — fast and drift-detecting without reading terabytes; recorded as 'manifest' so the
+    weaker guarantee is explicit."""
+    import hashlib
+    p = Path(path)
+    if p.is_file():
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return "sha256", h.hexdigest()
+    h = hashlib.sha256()
+    for f in sorted(p.rglob("*")):
+        if f.is_file():
+            h.update(f"{f.relative_to(p).as_posix()}\t{f.stat().st_size}\n".encode())
+    return "manifest", h.hexdigest()
+
+
+def cmd_adopt(a):
+    """Declare that an experiment ADOPTS an external artifact: records source path + content hash
+    in out/adopted.json (the durable, self-describing reference) and drops a convenience symlink in
+    out/. The record, not the symlink, is the contract — doctor verifies the source still exists
+    and still matches the hash, so a backfilled experiment isn't silently coupled to a mutable
+    external results/ dir. `lab-exp materialize` later converts symlink -> real copy if wanted."""
+    root = find_root(a.root)
+    d = exp_dir(root, a.id)
+    out = d / "out"
+    out.mkdir(exist_ok=True)
+    src = Path(a.path).expanduser().resolve()
+    if not src.exists():
+        die(f"source does not exist: {src}")
+    name = a.as_ or src.name
+    dest = out / name
+    if dest.exists() or dest.is_symlink():
+        die(f"out/{name} already exists — pick another --as")
+    kind, digest = _content_hash(src)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.symlink_to(src)
+    rec_f = out / "adopted.json"
+    recs = json.loads(rec_f.read_text()) if rec_f.is_file() else []
+    recs.append({"name": name, "source": str(src), "hash_kind": kind, "hash": digest,
+                 "adopted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 "by": agent_name()})
+    rec_f.write_text(json.dumps(recs, indent=2))
+    print(f"adopted {src}\n  -> out/{name} (symlink) + out/adopted.json [{kind}:{digest[:12]}...]")
+    print("  doctor now verifies existence+hash; `lab-exp materialize` converts to a real copy.")
+
+
+def cmd_lineage(a):
+    """An experiment's ANCESTORS (transitive based_on parents, DAG-aware) with dirs — the cheap set
+    to grep for reusable code before writing a helper. Reuse found here is PROMOTED to the package,
+    not imported experiment-to-experiment (experiments stay self-contained + append-only)."""
+    root = find_root(a.root)
+    cfg = load_cfg(root)
+    pkg = cfg["project"].get("package", "lib")
+    rows, parents, _children = graph_maps(root)
+    eid = exp_dir(root, a.id).name
+    anc = _bfs(parents, eid)
+    print(f"{eid}  (kind={rows.get(eid, {}).get('kind', '?')})")
+    if not anc:
+        print("  (no parents — based_on is unset)")
+    else:
+        for n, d in anc:
+            print(f"  {'  ' * (d - 1)}└─ {n}  kind={rows.get(n, {}).get('kind', '?')}  experiments/{n}/")
+    print(f"\nBefore writing a helper: grep {pkg}/INDEX.md (already-shared) + these dirs "
+          f"(parent-local). If a parent already has it, PROMOTE it into {pkg}/ and import from "
+          f"there in both — do NOT import across experiment dirs.")
+
+
+def cmd_dag(a):
+    """The DAG as a PAGE: click a node, read its README.
+
+    `lab-exp graph` answers graph questions for an agent; this answers "what did I do and why" for a
+    human. Data is assembled here (graph_maps stays the single source of edge semantics) and rendered
+    by bin/_exp-dag.py into one self-contained HTML file — hand it to `lab-report publish` and it is
+    phone-readable.
+
+      lab-exp dag                 # -> ./exp-dag.html
+      lab-exp dag --out X.html    # -> X.html   ('-' = stdout, for piping to lab-report)
+    """
+    root = find_root(a.root)
+    if getattr(a, "serve", False):
+        return dag_serve(root, a.port)
+    html_out = dag_html(root)
+    if a.out == "-":
+        sys.stdout.write(html_out)
+        return
+    out = Path(a.out or "exp-dag.html")
+    out.write_text(html_out)
+    print(f"{out}")
+    print(f"  open it:      open {out}   (or regenerate live: lab-exp dag --serve)")
+    return
+
+
+def dag_html(root, live=False):
+    rows, parents, _children = graph_maps(root)
+    nodes = []
+    for eid, r in rows.items():
+        d = root / "experiments" / eid
+        readme = ""
+        rp = d / "README.md"
+        if rp.is_file():
+            try:
+                readme = rp.read_text(errors="replace")
+            except OSError:
+                pass       # unreadable README is not worth failing the whole page over
+        # Any .html at out/ top level or ONE subdir deep (covers both conventions: out/report.html
+        # and out/viz/*.html). Bounded glob, never a recursive walk -- backfill out/ trees hold
+        # hundreds of thousands of files on NFS. report.html sorts first; capped at 20.
+        outd = d / "out"
+        try:
+            reps = sorted((q.relative_to(outd).as_posix()
+                           for q in list(outd.glob("*.html")) + list(outd.glob("*/*.html"))),
+                          key=lambda q: (q != "report.html", q))[:20]
+        except OSError:
+            reps = []
+        nodes.append({k: r.get(k, "") for k in REG_COLS} | {
+            "dir": f"experiments/{eid}", "readme": readme, "reports": reps})
+    payload = {
+        "project": load_cfg(root)["project"].get("name") or root.name,
+        "nodes": sorted(nodes, key=lambda n: n["id"]),
+        "edges": [{"child": c, "parent": p} for c, ps in parents.items() for p in ps],
+    }
+    cmd = [sys.executable, str(Path(__file__).resolve().parent / "_exp-dag.py")] + (["--live"] if live else [])
+    r = subprocess.run(cmd, input=json.dumps(payload), text=True, capture_output=True)
+    if r.returncode != 0:
+        die(r.stderr.strip() or "dag render failed")
+    return r.stdout
+
+
+def dag_serve(root, port):
+    """Serve the DAG live: every GET re-renders from the registry, and the page's supersede/undo
+    buttons POST back here — click-to-supersede with the same locked writes as the CLI."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    if not port:
+        with socket.socket() as sk:
+            sk.bind(("", 0))
+            port = sk.getsockname()[1]
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body, ctype):
+            b = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            if self.path.startswith("/report/"):
+                # /report/<eid>/<relpath under out/>. Both segments come off the wire: the eid
+                # resolves through exp_dir (validates existence); the relpath is confined
+                # LEXICALLY (no .. segments, not absolute, .html only). Deliberately NOT a
+                # resolved-prefix check: out/ routinely holds symlinks to the experiment's own
+                # artifacts on other volumes (IterativeResiduals links reports through results/
+                # -> /ewsc), and those are exactly what this route exists to serve. The server
+                # is the owner's localhost tool; symlinks inside out/ are the owner's.
+                try:
+                    from urllib.parse import unquote
+                    eid, _, rel = unquote(self.path[len("/report/"):]).partition("/")
+                    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+                        raise ValueError("bad path")
+                    f = exp_dir(root, eid) / "out" / rel
+                    if not (f.suffix == ".html" and f.is_file()):
+                        raise ValueError("not a report")
+                    self._send(200, f.read_text(errors="replace"), "text/html; charset=utf-8")
+                except (Exception, SystemExit):
+                    self._send(404, "no such report", "text/plain")
+                return
+            self._send(200, dag_html(root, live=True), "text/html; charset=utf-8")
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                req = json.loads(self.rfile.read(n) or b"{}")
+                if self.path == "/supersede":
+                    succ = do_supersede(root, req["old"], req.get("by", ""), req.get("why", ""))
+                    out = {"ok": True, "old": req["old"], "by": succ}
+                elif self.path == "/undo":
+                    do_unsupersede(root, req["id"])
+                    out = {"ok": True, "id": req["id"]}
+                elif self.path == "/important":
+                    do_set_important(root, req["id"], bool(req.get("on")))
+                    out = {"ok": True, "id": req["id"], "on": bool(req.get("on"))}
+                else:
+                    raise ValueError(f"unknown endpoint {self.path}")
+            # SystemExit included: exp_dir() die()s on an unknown id, and that must fail the
+            # REQUEST, not the server.
+            except (Exception, SystemExit) as e:
+                self._send(400, json.dumps({"ok": False, "error": str(e) or "bad request"}), "application/json")
+                return
+            self._send(200, json.dumps(out), "application/json")
+
+    host = socket.gethostname().split(".")[0]
+    print(f"serving live DAG on {host}:{port}  (Ctrl-C stops; every reload re-reads the registry)")
+    print(f"  local:             http://localhost:{port}")
+    print(f"  from your laptop:  ssh -L {port}:localhost:{port} {host}   ->   http://localhost:{port}")
+    try:
+        HTTPServer(("", port), H).serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    print(f"  publish it:   lab-exp dag --out - | lab-report publish /dev/stdin --title "
+          f"{shlex.quote(payload['project'] + ' — experiment DAG')}")
+
+
+def cmd_graph(a):
+    """The experiment DAG as data — for programmatic/graph queries (kind-filtered ancestors or
+    descendants, with dirs/files), instead of the agent reading and walking files itself.
+
+    lab-exp graph                          # whole DAG -> JSON (nodes+edges) ; --dot for graphviz
+    lab-exp graph <id> [--up|--down|--both]  # one node's ancestors / descendants / both
+        [--kind K]   restrict to that experiment kind      [--files]  include each node's files
+        [--json]     machine-readable                      (default: readable tree)
+    """
+    root = find_root(a.root)
+    rows, parents, children = graph_maps(root)
+    if not a.id:
+        if a.dot:
+            print("digraph experiments {")
+            for e, r in rows.items():
+                print(f'  "{e}" [label="{e}\\n{r.get("kind","")}"];')
+            for c, ps in parents.items():
+                for pp in ps:
+                    print(f'  "{pp}" -> "{c}";')
+            print("}")
+        else:
+            print(json.dumps({
+                "nodes": [{"id": e, "kind": r.get("kind", ""), "status": r.get("status", ""),
+                           "tags": r.get("tags", ""), "dir": f"experiments/{e}"}
+                          for e, r in rows.items()],
+                "edges": [{"child": c, "parent": pp} for c, ps in parents.items() for pp in ps],
+            }, indent=2))
+        return
+    eid = exp_dir(root, a.id).name
+    maps = (rows, parents, children)
+    sections = {}
+    if a.direction in ("up", "both"):
+        sections["ancestors"] = _bfs(parents, eid)
+    if a.direction in ("down", "both"):
+        sections["descendants"] = _bfs(children, eid)
+
+    def node(n, d):
+        r = rows.get(n, {})
+        o = {"id": n, "depth": d, "kind": r.get("kind", ""), "dir": f"experiments/{n}"}
+        if a.files:
+            dd = root / "experiments" / n
+            o["files"] = (sorted(str(p.relative_to(root)) for p in dd.rglob("*") if p.is_file())
+                          if dd.is_dir() else [])
+        return o
+
+    out = {rel: [node(n, d) for n, d in lst if not a.kind or rows.get(n, {}).get("kind") == a.kind]
+           for rel, lst in sections.items()}
+    if a.json:
+        print(json.dumps({"id": eid, "kind": rows.get(eid, {}).get("kind", ""), **out}, indent=2))
+        return
+    print(f"{eid}  (kind={rows.get(eid, {}).get('kind', '?')})"
+          + (f"  [filtered to kind={a.kind}]" if a.kind else ""))
+    for rel in ("ancestors", "descendants"):
+        if rel not in out:
+            continue
+        print(f"  {rel}:" + ("" if out[rel] else " (none)"))
+        for o in out[rel]:
+            line = f"    {'  ' * (o['depth'] - 1)}{o['id']}  kind={o['kind']}  {o['dir']}/"
+            print(line)
+            if a.files:
+                for f in o["files"]:
+                    print(f"        {f}")
+
+
+def cmd_rename(a):
+    """Rename a kind or a tag across the project: registry rows, README frontmatter, and the
+    declared lists in .lab-exp.toml. Exact-token replacement (a tag rename takes the full
+    'key:value' token, or a bare key to rename the key everywhere)."""
+    root = find_root(a.root)
+    old, new = a.old, a.new
+    changed = 0
+
+    def sub_tag_token(csv):
+        toks = split_list(csv)
+        out = []
+        for t in toks:
+            if a.what == "tag":
+                if t == old:
+                    t = new
+                elif ":" not in old and t.startswith(old + ":"):
+                    t = new + t[len(old):]
+            out.append(t)
+        return ",".join(out)
+
+    with reg_lock(root):
+        rows = reg_read(root)
+        for r in rows:
+            if a.what == "kind" and r["kind"] == old:
+                r["kind"] = new
+            elif a.what == "tag":
+                nt = sub_tag_token(r["tags"])
+                if nt != r["tags"]:
+                    r["tags"] = nt
+        reg_write(root, rows)
+    for dd in sorted((root / "experiments").iterdir()):
+        rm = dd / "README.md"
+        if dd.name.startswith("_") or not rm.is_file():
+            continue
+        txt = rm.read_text()
+        orig = txt
+        if a.what == "kind":
+            txt = re.sub(rf"^kind:\s*{re.escape(old)}\s*$", f"kind: {new}", txt, flags=re.M)
+        else:
+            m = re.search(r"^tags:\s*(.*)$", txt, flags=re.M)
+            if m:
+                txt = txt[:m.start(1)] + sub_tag_token(m.group(1)) + txt[m.end(1):]
+        if txt != orig:
+            rm.write_text(txt)
+            changed += 1
+    cfgf = root / CONFIG_NAME
+    t = cfgf.read_text()
+    if a.what == "kind":
+        t2 = t.replace(f'"{old}"', f'"{new}"')
+    else:
+        key_old = old.split(":")[0]
+        key_new = new.split(":")[0]
+        t2 = t.replace(f'"{key_old}"', f'"{key_new}"') if ":" not in old and key_old != key_new else t
+    if t2 != t:
+        cfgf.write_text(t2)
+    print(f"renamed {a.what} '{old}' -> '{new}': registry updated, {changed} README(s) touched"
+          + (", config updated" if t2 != t else ""))
+    print("  re-run `lab-exp index` if visualizer MATCH/KIND declarations referenced it (edit those by hand).")
+
+
+def cmd_materialize(a):
+    """Make an experiment's out/ self-contained: replace symlinks with real copies, and/or import
+    external files INTO out/ under a chosen subpath. Backfills (migration.md step 2) point out/ at
+    original artifacts via symlink — fine locally, but they break when the experiment is archived,
+    moved, or the source is deleted. Materializing copies the real bytes in, so viz/reports/doctor
+    (all nested-path aware now) keep working from a portable directory.
+
+    lab-exp materialize <ID>                      # deref every symlink in out/ into a real copy
+    lab-exp materialize <ID> --import P [--as SUB] # copy external file/dir P into out/<SUB>
+    """
+    root = find_root(a.root)
+    d = exp_dir(root, a.id)
+    out = d / "out"
+    out.mkdir(exist_ok=True)
+    changed = 0
+    if a.import_path:
+        src = Path(a.import_path).expanduser()
+        if not src.exists():
+            die(f"--import path does not exist: {src}")
+        dest = out / (a.as_ or src.name)
+        if dest.exists() or dest.is_symlink():
+            die(f"{dest.relative_to(root)} already exists — pick another --as, or remove it first")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dest, symlinks=False)
+        else:
+            shutil.copy2(src, dest)
+        changed += 1
+        print(f"imported {src} -> {dest.relative_to(root)}")
+    # dereference any symlinks already in out/ (incl. one just imported as a dir of links)
+    for p in sorted(out.rglob("*")):
+        if p.is_symlink():
+            target = p.resolve()
+            if not target.exists():
+                warn(f"dangling symlink left as-is (target gone): {p.relative_to(root)} -> {os.readlink(p)}")
+                continue
+            p.unlink()
+            if target.is_dir():
+                shutil.copytree(target, p, symlinks=False)
+            else:
+                shutil.copy2(target, p)
+            changed += 1
+            print(f"materialized {p.relative_to(root)} (was -> {target})")
+    if not changed:
+        print(f"{d.name}: out/ already self-contained (no symlinks, nothing imported)")
+        return
+    meta = read_front(d / "README.md")
+    if str(meta.get("backfilled", "")).lower() in ("true", "1", "yes"):
+        print("  note: README still marked `backfilled: true`; out/ is now real copies, not "
+              "symlinks — the flag is harmless but you may drop it if this is no longer a backfill.")
+
+
+def cmd_list(a):
+    root = find_root(a.root)
+    rows = reg_read(root)
+    if a.kind:
+        rows = [r for r in rows if r["kind"] == a.kind]
+    if a.status:
+        rows = [r for r in rows if r["status"] == a.status]
+    if a.tag:
+        rows = [r for r in rows if a.tag in split_list(r["tags"])]
+    if not rows:
+        print("(no experiments match)")
+        return
+    for r in rows:
+        line = f"{r['id']:<34} {r['kind']:<10} {r['status']:<8} {r['tags']:<28}"
+        if r["metrics"]:
+            line += f" {r['metrics']}"
+        if r["finding"]:
+            line += f"  — {r['finding'][:90]}"
+        print(line)
+
+
+def cmd_projects(a):
+    if not PROJECTS_TSV.is_file():
+        print("(no lab-exp projects registered on this machine)")
+        return
+    print(PROJECTS_TSV.read_text(), end="")
+
+
+# ---------------------------------------------------------------- viz discovery
+
+def viz_modules(root, cfg):
+    """Parse (never import) <pkg>/viz/*.py for declarations."""
+    out = []
+    vz = pkg_dir(root, cfg) / "viz"
+    if not vz.is_dir():
+        return out
+    for f in sorted(vz.glob("*.py")):
+        if f.name.startswith("_"):
+            continue
+        try:
+            tree = ast.parse(f.read_text())
+        except SyntaxError as e:
+            warn(f"viz/{f.name}: syntax error ({e}) — skipped")
+            continue
+        info = dict(name=f.stem, doc=(ast.get_docstring(tree) or "").split("\n")[0],
+                    requires=[], match={}, kind=None, render=False, serve=False)
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if name in ("REQUIRES", "MATCH", "KIND"):
+                    try:
+                        info[name.lower() if name != "REQUIRES" else "requires"] = \
+                            ast.literal_eval(node.value)
+                    except (ValueError, SyntaxError):
+                        warn(f"viz/{f.name}: {name} is not a literal — ignored")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name in ("render", "serve"):
+                info[node.name] = True
+        out.append(info)
+    return out
+
+
+def out_artifacts(outdir):
+    """Relative posix paths of artifact files under out/, RECURSIVE — nested layouts (out/plots/x.png)
+    are first-class match targets. Derived/bookkeeping files are excluded so wildcard patterns like
+    '*.json' can't be satisfied by run-meta.json or a previous render in out/viz/."""
+    if not outdir.is_dir():
+        return set()
+    out, seen = set(), set()
+    # os.walk(followlinks=True), NOT rglob: rglob refuses to descend into symlinked dirs, so a
+    # backfill that symlinks a whole results/ dir into out/ silently yielded ZERO artifacts.
+    # realpath-dedup guards against symlink cycles.
+    for wroot, dirs, files in os.walk(outdir, followlinks=True):
+        rp = os.path.realpath(wroot)
+        if rp in seen:
+            dirs[:] = []
+            continue
+        seen.add(rp)
+        rel = os.path.relpath(wroot, outdir)
+        for f in files:
+            p = Path(wroot) / f
+            if not p.is_file():           # dangling symlink -> excluded
+                continue
+            r = f if rel == "." else f"{Path(rel).as_posix()}/{f}"
+            if r in ("run-meta.json", "run.log") or r.startswith("viz/"):
+                continue
+            out.add(r)
+    return out
+
+
+def artifact_match(pattern, files):
+    """One REQUIRES/produces pattern against the artifact set: a pattern containing '/' matches the
+    relative path (out/-rooted); a bare filename pattern matches its basename at ANY depth."""
+    if "/" in pattern:
+        return any(fnmatch.fnmatch(f, pattern) for f in files)
+    return any(fnmatch.fnmatch(f.rsplit("/", 1)[-1], pattern) for f in files)
+
+
+def viz_applicable(v, meta, outdir):
+    files = out_artifacts(outdir)
+    for req in v["requires"]:
+        if not artifact_match(req, files):
+            return False, f"missing {req}"
+    kinds = v["kind"] if isinstance(v["kind"], list) else [v["kind"]] if v["kind"] else []
+    if kinds and meta.get("kind") not in kinds:
+        return False, f"kind={meta.get('kind')} not in {kinds}"
+    tags = tags_dict(split_list(meta.get("tags", "")))
+    for k, want in (v["match"] or {}).items():
+        wants = want if isinstance(want, list) else [want]
+        if tags.get(k) not in wants:
+            return False, f"tag {k}={tags.get(k)} not in {wants}"
+    return True, ""
+
+
+def cmd_viz(a):
+    root = find_root(a.root)
+    cfg = load_cfg(root)
+    d = exp_dir(root, a.id)
+    meta = read_front(d / "README.md")
+    vs = viz_modules(root, cfg)
+    if not a.name:
+        if not vs:
+            print(f"(no visualizers in {cfg['project'].get('package', 'lib')}/viz/)")
+            return
+        for v in vs:
+            ok, why = viz_applicable(v, meta, d / "out")
+            modes = "+".join(m for m in ("render", "serve") if v[m]) or "none"
+            print(f"  {'APPLICABLE ' if ok else 'n/a        '}{v['name']:<24} [{modes}] {v['doc']}"
+                  + ("" if ok else f"  ({why})"))
+        return
+    v = next((x for x in vs if x["name"] == a.name), None) or die(f"no visualizer '{a.name}'")
+    ok, why = viz_applicable(v, meta, d / "out")
+    if not ok and not a.force:
+        die(f"'{a.name}' not applicable to {d.name}: {why} (--force to override)")
+    if not v["render"]:
+        die(f"'{a.name}' has no render() — use `lab-exp serve {a.name} {d.name}`")
+    pkg = cfg["project"].get("package", "lib")
+    out = d / "out" / "viz"
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); from pathlib import Path; "
+            f"from {pkg}.viz.{a.name} import render; "
+            f"paths = render(Path({str(d)!r}), Path({str(out)!r})); "
+            f"print('\\n'.join(str(p) for p in (paths or [])))")
+    rc = run_in_env(root, cfg, code)
+    sys.exit(rc)
+
+
+def run_in_env(root, cfg, pycode):
+    activate = cfg["env"].get("activate", "")
+    cmd = (f"cd {sh_q(str(root))} && " + (f"{activate} && " if activate else "")
+           + f"python -c {sh_q(pycode)}")
+    return subprocess.call(["bash", "-c", cmd])
+
+
+# ---------------------------------------------------------------- serve
+
+def serves_read():
+    if not SERVES_TSV.is_file():
+        return []
+    return [line.split("\t") for line in SERVES_TSV.read_text().splitlines() if line.strip()]
+
+
+def serves_write(rows):
+    SERVES_TSV.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SERVES_TSV.with_suffix(".tmp")
+    tmp.write_text("".join("\t".join(r) + "\n" for r in rows))
+    os.replace(tmp, SERVES_TSV)
+
+
+def tmux_alive(sess):
+    return subprocess.run(["tmux", "has-session", "-t", sess],
+                          capture_output=True).returncode == 0
+
+
+def cmd_serve(a):
+    if a.list:
+        rows, keep = serves_read(), []
+        for r in rows:
+            alive = tmux_alive(r[3])
+            print(f"  {'LIVE' if alive else 'DEAD'} port={r[2]} viz={r[1]} exps={r[4]} tmux={r[3]} since {r[5]}")
+            if alive:
+                keep.append(r)
+        serves_write(keep)
+        if not rows:
+            print("(no served visualizers)")
+        return
+    if a.stop:
+        rows = serves_read()
+        keep = []
+        for r in rows:
+            if r[2] == str(a.stop) or r[3] == a.stop:
+                subprocess.run(["tmux", "kill-session", "-t", r[3]], capture_output=True)
+                print(f"stopped {r[3]} (port {r[2]})")
+            else:
+                keep.append(r)
+        serves_write(keep)
+        return
+    if not a.name or not a.ids:
+        die("usage: lab-exp serve <viz-name> <ID...>  |  --list  |  --stop <port>")
+    root = find_root(a.root)
+    cfg = load_cfg(root)
+    dirs = [exp_dir(root, i) for i in a.ids]
+    vs = viz_modules(root, cfg)
+    v = next((x for x in vs if x["name"] == a.name), None) or die(f"no visualizer '{a.name}'")
+    if not v["serve"]:
+        die(f"'{a.name}' has no serve() — it is render-only")
+    for d in dirs:
+        ok, why = viz_applicable(v, read_front(d / "README.md"), d / "out")
+        if not ok and not a.force:
+            die(f"'{a.name}' not applicable to {d.name}: {why} (--force to override)")
+    with socket.socket() as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+    pkg = cfg["project"].get("package", "lib")
+    dl = ", ".join(f"Path({str(d)!r})" for d in dirs)
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); from pathlib import Path; "
+            f"from {pkg}.viz.{a.name} import serve; serve([{dl}], {port})")
+    activate = cfg["env"].get("activate", "")
+    inner = (f"cd {sh_q(str(root))} && " + (f"{activate} && " if activate else "")
+             + f"python -c {sh_q(code)}")
+    sess = f"exp-serve-{a.name}-{port}"
+    r = subprocess.run(["tmux", "new-session", "-d", "-s", sess, f"{inner}; sleep 30"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"tmux failed: {r.stderr.strip()}")
+    rows = serves_read()
+    rows.append([cfg["project"].get("name", root.name), a.name, str(port), sess,
+                 ",".join(d.name for d in dirs),
+                 datetime.now(timezone.utc).isoformat(timespec="seconds")])
+    serves_write(rows)
+    host = socket.gethostname().split(".")[0]
+    print(f"serving '{a.name}' on {host}:{port} (tmux {sess})")
+    print(f"  from your laptop:  ssh -L {port}:localhost:{port} {host}   ->   http://localhost:{port}")
+    print(f"  stop with:         lab-exp serve --stop {port}")
+
+
+# ---------------------------------------------------------------- index
+
+def pkg_health(root, cfg):
+    """Warnings about the SHAPE of the shared package, not its correctness.
+
+    The promotion ratchet said 'second use -> lift into <pkg>/' and agents satisfied its letter by
+    COPYING whole run scripts into the package: script-shaped modules (main guard + argparse),
+    modules nothing imports, 800-line files. Each check names the cheapest honest fix. Fan-in is
+    counted across the package AND experiments/, so a module used only by run.py files is not
+    called an orphan."""
+    pkg = pkg_dir(root, cfg)
+    pname = cfg["project"].get("package", "lib")
+    if not pkg.is_dir():
+        return []
+    fanin = {}
+    # Experiment code lives at the top of each experiment dir (run.py + odd helpers) — NEVER
+    # rglob experiments/ wholesale: out/ trees hold checkpoints and wandb dirs with tens of
+    # thousands of entries on NFS, and the walk takes minutes (observed hanging 2026-08-05).
+    exp_py = []
+    exps = root / "experiments"
+    if exps.is_dir():
+        for d in exps.iterdir():
+            if d.is_dir() and not d.name.startswith("_"):
+                exp_py += [p for p in d.glob("*.py")] + \
+                          [p for sub in d.iterdir() if sub.is_dir() and sub.name != "out"
+                           for p in sub.glob("*.py")]
+    pkg_py = list(pkg.rglob("*.py"))
+    # ONE read+parse per file, shared by the fan-in pass and the shape pass below — these all
+    # live on NFS, where a second read of a 50-module package is 50 needless round-trips.
+    parsed = {}
+    for f in pkg_py + exp_py:
+        try:
+            src = f.read_text()
+            parsed[f] = (src, ast.parse(src))
+        except (SyntaxError, UnicodeDecodeError, OSError):
+            continue
+    for f in pkg_py + exp_py:
+        if f not in parsed:
+            continue
+        tree = parsed[f][1]
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [n.name for n in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:      # relative: resolve against the importing file's package
+                    base = f.parent
+                    for _ in range(node.level - 1):
+                        base = base.parent
+                    try:
+                        prefix = ".".join((pname,) + base.relative_to(pkg).parts).rstrip(".")
+                    except ValueError:
+                        continue    # relative import in experiments/ — not a package module
+                    stem = f"{prefix}.{node.module}" if node.module else prefix
+                else:
+                    stem = node.module or ""
+                names = [stem] + [f"{stem}.{n.name}" for n in node.names]
+            for n in names:
+                if n == pname or n.startswith(pname + "."):
+                    fanin[n] = fanin.get(n, 0) + 1
+    warns = []
+    for f in sorted(pkg_py):
+        rel = f.relative_to(root)
+        parts = f.relative_to(pkg).parts
+        if f.name == "__init__.py" or f not in parsed:
+            continue
+        src, tree = parsed[f]
+        mod = pname + "." + ".".join(parts)[:-3]
+        importers = fanin.get(mod, 0)
+        is_main = any(isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                      and "__main__" in ast.dump(n.test) for n in tree.body)
+        has_argparse = any(isinstance(n, (ast.Import, ast.ImportFrom))
+                           and "argparse" in ast.dump(n) for n in tree.body)
+        if is_main or has_argparse:
+            warns.append(f"{rel}: script-shaped ({'main guard' if is_main else ''}"
+                         f"{'+' if is_main and has_argparse else ''}{'argparse' if has_argparse else ''}) — "
+                         "the package exports FUNCTIONS; the CLI belongs in an experiment's run.py. "
+                         "Extract the reusable functions, leave the argv wiring behind.")
+        elif importers == 0 and "viz" not in parts:
+            warns.append(f"{rel}: nothing in {pname}/ or experiments/ imports it — promoted as a "
+                         "dumped file? Fold its useful functions into the module that owns the "
+                         "topic, or delete it.")
+        n_lines = src.count("\n") + 1
+        if n_lines > 600:
+            warns.append(f"{rel}: {n_lines} lines — a module this size is usually several topics "
+                         "in one file; split it along the INDEX.md section boundaries.")
+    return warns
+
+
+def cmd_index(a):
+    root = find_root(getattr(a, "root", None))
+    cfg = load_cfg(root)
+    pkg = pkg_dir(root, cfg)
+    pname = cfg["project"].get("package", "lib")
+    lines = [f"# {pname}/ INDEX — auto-generated by `lab-exp index`; DO NOT edit by hand.",
+             "", "Check here FIRST before writing any new method, model, loop, or visualizer.", ""]
+    mods = sorted(p for p in pkg.rglob("*.py")
+                  if "viz" not in p.relative_to(pkg).parts and not p.name.startswith("_"))
+    for f in mods:
+        try:
+            tree = ast.parse(f.read_text())
+        except SyntaxError:
+            continue
+        rel = f.relative_to(root)
+        doc = (ast.get_docstring(tree) or "").split("\n")[0]
+        entries = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+                sig = f"{node.name}({', '.join(x.arg for x in node.args.args)})"
+                d1 = (ast.get_docstring(node) or "").split("\n")[0]
+                entries.append(f"- `{sig}`" + (f" — {d1}" if d1 else ""))
+            elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                d1 = (ast.get_docstring(node) or "").split("\n")[0]
+                entries.append(f"- `class {node.name}`" + (f" — {d1}" if d1 else ""))
+        if entries or doc:
+            lines.append(f"### {rel}" + (f" — {doc}" if doc else ""))
+            lines += entries + [""]
+    vs = viz_modules(root, cfg)
+    if vs:
+        lines += ["## Visualizers", "",
+                  "Dispatch: REQUIRES (files in out/) + MATCH (structured tags) + KIND.",
+                  "`lab-exp viz <ID>` lists applicable; render() feeds reports, serve() hosts interactive apps.", ""]
+        for v in vs:
+            modes = "+".join(m for m in ("render", "serve") if v[m]) or "none"
+            cons = f"REQUIRES={v['requires']}"
+            if v["match"]:
+                cons += f" MATCH={v['match']}"
+            if v["kind"]:
+                cons += f" KIND={v['kind']}"
+            lines.append(f"- **{v['name']}** [{modes}] — {v['doc']}  ({cons})")
+        lines.append("")
+    (pkg / "INDEX.md").write_text("\n".join(lines))
+    print(f"wrote {pkg / 'INDEX.md'} ({len(mods)} modules, {len(vs)} visualizers)")
+    # `index` is run right after every promotion (rule 2), so this is the moment a dumped-script
+    # promotion is cheapest to fix — surface package-shape warnings here, not only in doctor.
+    for w in pkg_health(root, cfg):
+        warn(w)
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(a):
+    root = find_root(a.root)
+    cfg = load_cfg(root)
+    issues = 0
+
+    def flag(msg):
+        nonlocal issues
+        issues += 1
+        warn(msg)
+
+    rows = {r["id"]: r for r in reg_read(root)}
+    dirs = {p.name: p for p in (root / "experiments").iterdir()
+            if p.is_dir() and not p.name.startswith("_")}
+    for eid in sorted(set(dirs) - set(rows)):
+        flag(f"{eid}: directory exists but not in _registry.tsv (created without `lab-exp new`?)")
+    for eid in sorted(set(rows) - set(dirs)):
+        flag(f"{eid}: in registry but directory missing (experiments are append-only — was it deleted?)")
+    kinds = cfg["project"].get("kinds", [])
+    tag_keys = cfg["project"].get("tag_keys", [])
+    for eid, d in sorted(dirs.items()):
+        meta = read_front(d / "README.md")
+        if not meta:
+            flag(f"{eid}: README.md missing or has no frontmatter")
+            continue
+        if kinds and meta.get("kind") not in kinds:
+            flag(f"{eid}: kind '{meta.get('kind')}' not in declared kinds {kinds}")
+        for k in tags_dict(split_list(meta.get("tags", ""))):
+            if tag_keys and k not in tag_keys:
+                flag(f"{eid}: tag key '{k}' not in declared tag_keys {tag_keys}")
+        out = d / "out"
+        arts = out_artifacts(out)
+        backfilled = str(meta.get("backfilled", "")).lower() in ("true", "1", "yes")
+        if arts and not (out / "run-meta.json").is_file() and not backfilled:
+            flag(f"{eid}: out/ has artifacts but no run-meta.json — run bypassed `lab-exp run` (not stamped; "
+                 "if this is a documented legacy backfill, add `backfilled: true` to its README frontmatter)")
+        row = rows.get(eid, {})
+        if row.get("status") == "running":
+            metaj = out / "run-meta.json"
+            if metaj.is_file():
+                age_h = (time.time() - metaj.stat().st_mtime) / 3600
+                if age_h > 48:
+                    flag(f"{eid}: status=running for {age_h:.0f}h — dead job or forgotten `lab-exp done`?")
+        if row.get("status") == "ran":
+            flag(f"{eid}: finished but finding not recorded — `lab-exp done {eid} --finding '...'`")
+        if row.get("git_sha", "").endswith("*"):
+            print(f"  note {eid}: ran from a dirty git tree (recorded SHA inexact)")
+        adf = out / "adopted.json"
+        if adf.is_file():
+            try:
+                for rec in json.loads(adf.read_text()):
+                    srcp = Path(rec.get("source", ""))
+                    if not srcp.exists():
+                        flag(f"{eid}: adopted artifact '{rec.get('name')}' source GONE: {srcp}"
+                             " — materialize a copy or re-adopt")
+                    else:
+                        kind, dig = _content_hash(srcp)
+                        if dig != rec.get("hash"):
+                            flag(f"{eid}: adopted artifact '{rec.get('name')}' has DRIFTED from its "
+                                 f"recorded {rec.get('hash_kind')} hash — source changed since adoption")
+            except (ValueError, OSError) as e:
+                flag(f"{eid}: unreadable adopted.json ({e})")
+    idx = pkg_dir(root, cfg) / "INDEX.md"
+    if idx.is_file():
+        newest = max((p.stat().st_mtime for p in pkg_dir(root, cfg).rglob("*.py")), default=0)
+        if newest > idx.stat().st_mtime + 60:
+            flag("INDEX.md is stale — run `lab-exp index`")
+    else:
+        flag("no INDEX.md — run `lab-exp index`")
+    cache_root = cfg["paths"].get("cache", "")
+    if cache_root:
+        cr = Path(cache_root)
+        if not cr.is_dir():
+            flag(f"[paths] cache = {cache_root} does not exist")
+        else:
+            known = set(rows) | set(dirs)
+            for entry in sorted(p for p in cr.iterdir() if p.is_dir()):
+                prov = next((f for f in entry.glob("PROVENANCE*") if f.is_file()), None)
+                if prov is None:
+                    flag(f"cache/{entry.name}: no PROVENANCE file — record which experiment generated it")
+                else:
+                    ids = re.findall(r"\d{8}-[a-z0-9][a-z0-9-]*", prov.read_text())
+                    if ids and not any(i in known for i in ids):
+                        flag(f"cache/{entry.name}: PROVENANCE names {ids[:2]} but no such experiment here")
+    for w in pkg_health(root, cfg):
+        flag(w)
+    dead = [r for r in serves_read() if not tmux_alive(r[3])]
+    for r in dead:
+        print(f"  note dead serve entry pruned: {r[1]} port {r[2]}")
+    if dead:
+        serves_write([r for r in serves_read() if tmux_alive(r[3])])
+    print(f"doctor: {issues} issue(s)" if issues else "doctor: clean")
+    sys.exit(1 if issues else 0)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="lab-exp", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--root", help="project root (default: walk up from cwd)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help="adopt lab-exp in the current project")
+    s.add_argument("--package", help="existing importable package (default: auto-detect or create lib/)")
+    s.add_argument("--site", choices=["cw", "exxact", "mac"])
+    s.add_argument("--activate", help='env activation line, e.g. "source .venv/bin/activate"')
+    s.add_argument("--wandb", action="store_true", help="enable wandb")
+
+    s = sub.add_parser("new", help="create a new experiment")
+    s.add_argument("slug")
+    s.add_argument("--kind", required=True)
+    s.add_argument("--tags", help="comma-separated, structured keys as k:v")
+    s.add_argument("--based-on", help="parent experiment id(s), comma-separated (multiple parents = a DAG)")
+    s.add_argument("--title")
+
+    s = sub.add_parser("run", help="stamp + launch an experiment")
+    s.add_argument("id")
+    s.add_argument("--gpus")
+    s.add_argument("--time")
+    s.add_argument("--partition")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--allow-dirty", action="store_true",
+                   help="run despite an uncommitted tree. Saves `git diff HEAD` to out/dirty.patch "
+                        "so SHA+patch still reproduces the run, and records git_dirty in run-meta. "
+                        "Untracked files are NOT in the patch — their names are recorded instead.")
+    s.add_argument("args", nargs="*", help="extra args for run.py — pass after `--`")
+
+    s = sub.add_parser("important", help="tag an experiment 'important' (plain tag; the DAG can filter to these)")
+    s.add_argument("id")
+    s.add_argument("--undo", action="store_true", help="remove the tag")
+    s.add_argument("--root", default=None)
+
+    s = sub.add_parser("supersede", help="mark an experiment overridden by a later one (status change; nothing is deleted)")
+    s.add_argument("id")
+    s.add_argument("--by", default="", help="the superseding experiment id")
+    s.add_argument("--why", default="", help="one line for the README Result section")
+    s.add_argument("--undo", action="store_true", help="restore status to done")
+    s.add_argument("--root", default=None)
+
+    s = sub.add_parser("done", help="record outcome + finding")
+    s.add_argument("id")
+    s.add_argument("--status", default="done", choices=["done", "failed", "abandoned"])
+    s.add_argument("--finding", help="one-line finding for the registry")
+    s.add_argument("--metrics", help="k=v,k=v key scalars")
+
+    s = sub.add_parser("adopt", help="declare an external artifact this experiment adopts (hash-recorded)")
+    s.add_argument("id")
+    s.add_argument("path", help="external file/dir to adopt")
+    s.add_argument("--as", dest="as_", metavar="NAME", help="name under out/ (default: source basename)")
+
+    s = sub.add_parser("lineage", help="show an experiment's based_on ancestry (dirs to grep before writing helpers)")
+    s.add_argument("id")
+
+    s = sub.add_parser("dag", help="the experiment DAG as an interactive HTML page (click a node -> its README)")
+    s.add_argument("--serve", action="store_true",
+                   help="serve the DAG live instead of writing a file: reloads re-read the registry, "
+                        "and the page gains mark-superseded / undo buttons that write it (locked, "
+                        "same code path as `lab-exp supersede`). Foreground; Ctrl-C stops.")
+    s.add_argument("--port", type=int, default=0, help="port for --serve (default: ephemeral)")
+    s.add_argument("--out", default="", metavar="FILE",
+                   help="output path (default ./exp-dag.html); '-' writes to stdout")
+
+    s = sub.add_parser("graph", help="the experiment DAG as data: kind-filtered ancestors/descendants, or whole-graph dump")
+    s.add_argument("id", nargs="?")
+    s.add_argument("--up", dest="direction", action="store_const", const="up")
+    s.add_argument("--down", dest="direction", action="store_const", const="down")
+    s.add_argument("--both", dest="direction", action="store_const", const="both")
+    s.add_argument("--kind")
+    s.add_argument("--files", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--dot", action="store_true")
+    s.set_defaults(direction="both")
+
+    s = sub.add_parser("rename", help="rename a kind or tag across registry/READMEs/config")
+    s.add_argument("what", choices=["kind", "tag"])
+    s.add_argument("old", help="kind name, full tag 'key:value', or bare tag key")
+    s.add_argument("new")
+
+    s = sub.add_parser("materialize", help="make out/ self-contained (deref symlinks / import files)")
+    s.add_argument("id")
+    s.add_argument("--import", dest="import_path", metavar="PATH",
+                   help="copy an external file/dir INTO out/ (then also deref any symlinks)")
+    s.add_argument("--as", dest="as_", metavar="SUBPATH",
+                   help="destination path under out/ for --import (default: source basename)")
+
+    s = sub.add_parser("list", help="show the registry")
+    s.add_argument("--kind")
+    s.add_argument("--status")
+    s.add_argument("--tag")
+
+    s = sub.add_parser("viz", help="list / run applicable visualizers")
+    s.add_argument("id")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--force", action="store_true")
+
+    s = sub.add_parser("serve", help="host an interactive visualizer (tmux + ssh tunnel)")
+    s.add_argument("name", nargs="?")
+    s.add_argument("ids", nargs="*")
+    s.add_argument("--list", action="store_true")
+    s.add_argument("--stop")
+    s.add_argument("--force", action="store_true")
+
+    sub.add_parser("index", help="regenerate the package INDEX.md")
+    sub.add_parser("doctor", help="drift checks")
+    sub.add_parser("projects", help="list lab-exp projects on this machine")
+
+    s = sub.add_parser("_stamp-hw")
+    s.add_argument("expdir")
+
+    a = p.parse_args()
+    {"init": cmd_init, "new": cmd_new, "run": cmd_run, "done": cmd_done, "supersede": cmd_supersede, "important": cmd_important,
+     "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
+     "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
+     "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
+     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects,
+     "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
