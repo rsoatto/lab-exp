@@ -101,6 +101,7 @@ TEMPLATE = r"""<!doctype html>
  .node.hit { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--fg) 40%, transparent)); }
  .node.miss { opacity:.13; }
  .edge.miss { opacity:.05; }
+ .edge.inherit { stroke-dasharray:4 3; }
  .actions { display:flex; gap:.5rem; margin:.2rem 0 .9rem; }
  .actions button { font:inherit; font-size:.8rem; padding:.3rem .7rem; border-radius:7px;
    border:1px solid var(--line); background:var(--bg); color:inherit; cursor:pointer; }
@@ -143,9 +144,10 @@ for (const e of EDGES) {
 /* ---- layered layout -------------------------------------------------------------------- */
 // Longest-path layering: depth = 1 + max(depth of parents). Iterative with a cap rather than
 // recursive, so a malformed based_on cycle degrades to a drawing instead of a stack overflow.
-function layout(ids) {
+function layout(ids, parentMap) {
   const set = new Set(ids);
-  const par = id => parents.get(id).filter(p => set.has(p));
+  const pm = parentMap || parents;
+  const par = id => (pm.get(id) || []).filter(p => set.has(p));
   const depth = new Map(ids.map(i => [i, 0]));
   for (let pass = 0; pass < ids.length + 1; pass++) {
     let moved = false;
@@ -227,20 +229,50 @@ const esc = s => String(s ?? "");
 
 let POS = null;   // node id -> {x,y,w,h}; kept from the single layout so search can frame matches
 
+/* When superseded nodes are HIDDEN, their successor stands in for them structurally: every edge
+   touching a hidden superseded node reroutes to its ultimate visible successor (superseded_by
+   chains followed recursively), drawn dashed. Without this, hiding a node orphans its successor
+   and the lineage the DAG exists to show evaporates. Chains that dead-end (no successor) drop
+   their edges, as before. Scoped to superseded-hiding only -- the important-only filter is a lens,
+   not a replacement relation, so it does not reroute. */
+function repOf(id) {
+  let cur = id;
+  for (let i = 0; i < 50 && !showSup && SUP.has(cur); i++) {
+    const nxt = ((byId.get(cur) || {}).superseded_by || "").trim();
+    if (!nxt || !byId.has(nxt)) return null;      // hidden with no successor: edges drop
+    cur = nxt;
+  }
+  return (!showSup && SUP.has(cur)) ? null : cur; // cycle guard tripped: treat as dead end
+}
+let EFF = { parents, children };                  // effective adjacency of the CURRENT drawing
+function effectiveEdges(SH) {
+  const seen = new Map();                         // "p->c" -> {parent, child, synthetic}
+  for (const e of EDGES) {
+    const P = repOf(e.parent), C = repOf(e.child);
+    if (!P || !C || P === C || !SH.has(P) || !SH.has(C)) continue;
+    const k = P + "\u0000" + C, syn = P !== e.parent || C !== e.child;
+    if (!seen.has(k) || !syn) seen.set(k, { parent: P, child: C, synthetic: seen.has(k) ? (seen.get(k).synthetic && syn) : syn });
+  }
+  return [...seen.values()];
+}
+
 function draw() {
   const ids = shownIds(), SH = new Set(ids);
-  const { pos, width, height } = layout(ids);
+  const eff = effectiveEdges(SH);
+  const ep = new Map(ids.map(i => [i, []])), ec = new Map(ids.map(i => [i, []]));
+  for (const e of eff) { ep.get(e.child).push(e.parent); ec.get(e.parent).push(e.child); }
+  EFF = { parents: ep, children: ec };
+  const { pos, width, height } = layout(ids, ep);
   POS = pos;
   svg.replaceChildren();
   const gEdges = el("g"), gNodes = el("g");
 
-  for (const e of EDGES) {
-    if (!SH.has(e.parent) || !SH.has(e.child)) continue;
+  for (const e of eff) {
     const a = pos.get(e.parent), b = pos.get(e.child);
     const x1 = a.x + a.w / 2, y1 = a.y + a.h, x2 = b.x + b.w / 2, y2 = b.y;
     const m = (y1 + y2) / 2;
     gEdges.appendChild(el("path", {
-      class: "edge", "data-c": e.child, "data-p": e.parent,
+      class: "edge" + (e.synthetic ? " inherit" : ""), "data-c": e.child, "data-p": e.parent,
       d: `M${x1},${y1} C${x1},${m} ${x2},${m} ${x2},${y2}`,
       fill: "none", stroke: cssv("--line"), "stroke-width": 1.4, "marker-end": "url(#arrow)"
     }));
@@ -292,7 +324,8 @@ const apply = () => svg.setAttribute("viewBox",
 // nodes and read as clutter. Deeper lineage stays one click away (the panel's parent/child links
 // walk it hop by hop) and `lab-exp lineage` prints it whole.
 function highlight(id) {
-  const hot = new Set([id, ...parents.get(id), ...children.get(id)]);
+  const hot = new Set([id, ...(EFF.parents.get(id) || parents.get(id) || []),
+                           ...(EFF.children.get(id) || children.get(id) || [])]);
   svg.querySelectorAll(".node").forEach(g =>
     g.classList.toggle("dim", !hot.has(g.dataset.id)));
   svg.querySelectorAll(".edge").forEach(p => {
