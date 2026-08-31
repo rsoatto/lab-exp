@@ -208,10 +208,14 @@ const ALL_IDS = NODES.map(n => n.id);
 const SUP = new Set(NODES.filter(n => n.status === "superseded").map(n => n.id));
 // 'important' is a plain token in the ordinary tags field -- the DAG just gives it a filter and
 // (when live) a toggle; lab-exp important <id> is the CLI spelling.
-const isImp = id => (byId.get(id).tags || "").split(",").map(t => t.trim()).includes("important");
+const tagsOf = n => (n.tags || "").split(",").map(t => t.trim()).filter(Boolean);
+const isImp = id => tagsOf(byId.get(id)).includes("important");
 const impCount = () => ALL_IDS.filter(isImp).length;
 let showSup = false, impOnly = false;
-const shownIds = () => ALL_IDS.filter(id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id)));
+// THE visibility predicate -- the only definition. Search and drawing both use it; a new filter
+// gets added here once.
+const visible = id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id));
+const shownIds = () => ALL_IDS.filter(visible);
 
 function el(t, a = {}, kids = []) {
   const n = document.createElementNS(NS, t);
@@ -346,7 +350,7 @@ async function api(path, body) {
     const j = await r.json();
     if (!j.ok) throw new Error(j.error || "request failed");
     return j;
-  } catch (e) { alert("supersede failed: " + e.message); return null; }
+  } catch (e) { alert("request failed: " + e.message); return null; }
 }
 function setPicking(p) {
   picking = p;
@@ -359,9 +363,7 @@ function applyLocal(id, status, by) {
   const n = byId.get(id);
   n.status = status; n.superseded_by = by;
   if (status === "superseded") SUP.add(id); else SUP.delete(id);
-  const lab = document.getElementById("suplabel");
-  lab.style.display = SUP.size ? "" : "none";
-  document.getElementById("supn").textContent = SUP.size;
+  refreshSup();
   draw();
   document.getElementById("count").textContent = countText();
   select(id);
@@ -407,8 +409,7 @@ function select(id) {
         `<a href="${LIVE ? "/report/" + esc(id) + "/" + esc(rp) : esc(n.dir) + "/out/" + esc(rp)}"
             target="_blank" style="font-size:.85rem">▤ ${esc(rp.replace(/\.html$/, ""))}</a>`).join("")}</div>` : ""}
     ${n.finding ? `<p style="font-size:.9rem">${esc(n.finding)}</p>` : ""}
-    <div class="chips">${(n.tags || "").split(",").filter(Boolean)
-        .map(t => `<span class="chip">${esc(t.trim())}</span>`).join("")}</div>
+    <div class="chips">${tagsOf(n).map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div>
     <dl class="kv">${kv}</dl>
     ${rel(parents.get(id), "parents")}${rel(children.get(id), "children")}
     <div class="md">${n.readme ? md(n.readme) : "<p class='meta'>(no README.md)</p>"}</div>`;
@@ -420,12 +421,9 @@ function select(id) {
   on("btn-nosucc", () => doSupersede(id, ""));
   on("btn-undo",   async () => { if (await api("/undo", { id })) applyLocal(id, "done", ""); });
   on("btn-imp",    async () => {
-    const on_ = !isImp(id);
-    if (!await api("/important", { id, on: on_ })) return;
-    const n2 = byId.get(id);
-    const toks = (n2.tags || "").split(",").map(t => t.trim()).filter(t => t && t !== "important");
-    if (on_) toks.push("important");
-    n2.tags = toks.join(",");
+    const res = await api("/important", { id, on: !isImp(id) });
+    if (!res) return;
+    byId.get(id).tags = res.tags;      // server returns the canonical string -- no client surgery
     refreshImp(); draw(); select(id);
   });
   side.scrollTop = 0;
@@ -455,7 +453,7 @@ function md(src) {
 const q = document.getElementById("q");
 q.addEventListener("input", () => {
   const t = q.value.trim().toLowerCase();
-  matched = !t ? null : new Set(NODES.filter(n => (showSup || !SUP.has(n.id)) && (!impOnly || isImp(n.id))).filter(n =>
+  matched = !t ? null : new Set(NODES.filter(n => visible(n.id)).filter(n =>
     [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
   const nShown = shownIds().length;
   const hits = matched ? matched.size : nShown;
@@ -526,15 +524,18 @@ document.getElementById("legend").innerHTML =
 const countText = () => (showSup || !SUP.size ? `${shownIds().length} experiments`
   : `${shownIds().length} experiments (${SUP.size} superseded hidden)`)
   + (impOnly ? " · important only" : "");
+function refreshSup() {
+  document.getElementById("suplabel").style.display = SUP.size ? "" : "none";
+  document.getElementById("supn").textContent = SUP.size;
+}
 function refreshImp() {
   const n = impCount();
   const lab = document.getElementById("implabel");
   lab.style.display = (n || LIVE) ? "" : "none";   // live pages show it once marking is possible
   document.getElementById("impn").textContent = n;
 }
+refreshSup();
 if (SUP.size) {
-  document.getElementById("suplabel").style.display = "";
-  document.getElementById("supn").textContent = SUP.size;
   document.getElementById("showsup").addEventListener("change", ev => {
     showSup = ev.target.checked;
     if (selected && SUP.has(selected) && !showSup) { selected = null; }

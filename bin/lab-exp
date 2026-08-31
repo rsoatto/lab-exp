@@ -956,29 +956,35 @@ def do_supersede(root, old, by, why):
     return succ
 
 
-def do_unsupersede(root, old):
-    eid = exp_dir(root, old).name
+def reg_edit(root, eid, mutate):
+    """Locked read-modify-write of one row. This is how a field gets CLEARED: reg_upsert's merge
+    skips empty values by design ("leave unchanged"), so writing "" requires the full RMW."""
     with reg_lock(root):
         rows = reg_read(root)
         for r in rows:
             if r["id"] == eid:
-                r["status"], r["superseded_by"] = "done", ""
+                mutate(r)
         reg_write(root, rows)
+
+
+def do_unsupersede(root, old):
+    reg_edit(root, exp_dir(root, old).name,
+             lambda r: r.update(status="done", superseded_by=""))
 
 
 def do_set_important(root, old, on):
-    """Add/remove the plain 'important' token in the tags column. Locked RMW because removal can
-    leave tags empty, which reg_upsert's skip-empty merge could not write back."""
-    eid = exp_dir(root, old).name
-    with reg_lock(root):
-        rows = reg_read(root)
-        for r in rows:
-            if r["id"] == eid:
-                toks = [t for t in split_list(r.get("tags", "")) if t != "important"]
-                if on:
-                    toks.append("important")
-                r["tags"] = ",".join(toks)
-        reg_write(root, rows)
+    """Add/remove the plain 'important' token in the tags column. Returns the new tags string --
+    the server hands it to the page so the client never re-implements the token surgery."""
+    new = {}
+
+    def mut(r):
+        toks = [t for t in split_list(r.get("tags", "")) if t != "important"]
+        if on:
+            toks.append("important")
+        r["tags"] = new["tags"] = ",".join(toks)
+
+    reg_edit(root, exp_dir(root, old).name, mut)
+    return new.get("tags", "")
 
 
 def cmd_important(a):
@@ -1130,8 +1136,8 @@ def cmd_dag(a):
     out = Path(a.out or "exp-dag.html")
     out.write_text(html_out)
     print(f"{out}")
-    print(f"  open it:      open {out}   (or regenerate live: lab-exp dag --serve)")
-    return
+    print(f"  open it:      open {out}   (or serve it live: lab-exp dag --serve)")
+    print("  publish it:   lab-exp dag --out - | lab-report publish /dev/stdin --title '<project> — experiment DAG'")
 
 
 def dag_html(root, live=False):
@@ -1163,11 +1169,30 @@ def dag_html(root, live=False):
         "nodes": sorted(nodes, key=lambda n: n["id"]),
         "edges": [{"child": c, "parent": p} for c, ps in parents.items() for p in ps],
     }
-    cmd = [sys.executable, str(Path(__file__).resolve().parent / "_exp-dag.py")] + (["--live"] if live else [])
-    r = subprocess.run(cmd, input=json.dumps(payload), text=True, capture_output=True)
-    if r.returncode != 0:
-        die(r.stderr.strip() or "dag render failed")
-    return r.stdout
+    # In-process render: _exp-dag.py sits beside this script (main-guarded, so import is clean);
+    # forking an interpreter per render piped the multi-MB payload through twice for three
+    # str.replace calls -- noticeable when --serve re-renders on every reload.
+    import html as _html
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_exp_dag", Path(__file__).resolve().parent / "_exp-dag.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    title = _html.escape(payload["project"] or "experiments", quote=True)
+    return (mod.TEMPLATE.replace("__TITLE__", title)
+            .replace("__LIVE__", "true" if live else "false")
+            .replace("__DATA__", json.dumps(payload, ensure_ascii=False)))
+
+
+def ephemeral_port():
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def print_tunnel_hint(port):
+    host = socket.gethostname().split(".")[0]
+    print(f"  from your laptop:  ssh -L {port}:localhost:{port} {host}   ->   http://localhost:{port}")
 
 
 def dag_serve(root, port):
@@ -1175,9 +1200,7 @@ def dag_serve(root, port):
     buttons POST back here — click-to-supersede with the same locked writes as the CLI."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     if not port:
-        with socket.socket() as sk:
-            sk.bind(("", 0))
-            port = sk.getsockname()[1]
+        port = ephemeral_port()
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -1225,8 +1248,8 @@ def dag_serve(root, port):
                     do_unsupersede(root, req["id"])
                     out = {"ok": True, "id": req["id"]}
                 elif self.path == "/important":
-                    do_set_important(root, req["id"], bool(req.get("on")))
-                    out = {"ok": True, "id": req["id"], "on": bool(req.get("on"))}
+                    tags = do_set_important(root, req["id"], bool(req.get("on")))
+                    out = {"ok": True, "id": req["id"], "on": bool(req.get("on")), "tags": tags}
                 else:
                     raise ValueError(f"unknown endpoint {self.path}")
             # SystemExit included: exp_dir() die()s on an unknown id, and that must fail the
@@ -1236,16 +1259,13 @@ def dag_serve(root, port):
                 return
             self._send(200, json.dumps(out), "application/json")
 
-    host = socket.gethostname().split(".")[0]
-    print(f"serving live DAG on {host}:{port}  (Ctrl-C stops; every reload re-reads the registry)")
+    print(f"serving live DAG on {socket.gethostname().split('.')[0]}:{port}  (Ctrl-C stops; every reload re-reads the registry)")
     print(f"  local:             http://localhost:{port}")
-    print(f"  from your laptop:  ssh -L {port}:localhost:{port} {host}   ->   http://localhost:{port}")
+    print_tunnel_hint(port)
     try:
         HTTPServer(("", port), H).serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
-    print(f"  publish it:   lab-exp dag --out - | lab-report publish /dev/stdin --title "
-          f"{shlex.quote(payload['project'] + ' — experiment DAG')}")
 
 
 def cmd_graph(a):
@@ -1634,9 +1654,7 @@ def cmd_serve(a):
         ok, why = viz_applicable(v, read_front(d / "README.md"), d / "out")
         if not ok and not a.force:
             die(f"'{a.name}' not applicable to {d.name}: {why} (--force to override)")
-    with socket.socket() as s:
-        s.bind(("", 0))
-        port = s.getsockname()[1]
+    port = ephemeral_port()
     pkg = cfg["project"].get("package", "lib")
     dl = ", ".join(f"Path({str(d)!r})" for d in dirs)
     code = (f"import sys; sys.path.insert(0, {str(root)!r}); from pathlib import Path; "
@@ -1656,7 +1674,7 @@ def cmd_serve(a):
     serves_write(rows)
     host = socket.gethostname().split(".")[0]
     print(f"serving '{a.name}' on {host}:{port} (tmux {sess})")
-    print(f"  from your laptop:  ssh -L {port}:localhost:{port} {host}   ->   http://localhost:{port}")
+    print_tunnel_hint(port)
     print(f"  stop with:         lab-exp serve --stop {port}")
 
 
