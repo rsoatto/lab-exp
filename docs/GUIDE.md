@@ -1,6 +1,6 @@
 ---
 name: lab-experiments
-description: "How to structure and run experiments in any project managed with `lab-exp` (a `.lab-exp.toml` at the project root marks one). Use whenever you are about to train a model, run an ablation/sweep/analysis, write a plot, or add a method to a research codebase: check the registry and INDEX first, create experiments with `lab-exp new` (never ad-hoc scripts), launch with `lab-exp run` (stamps git SHA/command/hardware for reproducibility; submits via SLURM on the CW cell), record outcomes with `lab-exp done`, mark overridden results with `lab-exp supersede` (never delete; 'mark as superseded/obsolete/defunct/replaced' means this), flag key results with `lab-exp important <id>` (a plain tag the DAG can star and filter to), and visualize through the shared `<pkg>/viz/` layer (`lab-exp viz` / `serve`). Core rules: experiments are APPEND-ONLY; shared code lives in ONE package (promotion ratchet: second use → promote into it); never rewrite a method or visualizer that already exists — grep INDEX.md first. Also covers adopting lab-exp in a new/existing project (`lab-exp init`, see migration.md). Claude Code / codex on any lab machine."
+description: "How to structure and run experiments in any project managed with `lab-exp` (a `.lab-exp.toml` at the project root marks one). Use whenever you are about to train a model, run an ablation/sweep/analysis, write a plot, or add a method to a research codebase: check the registry and INDEX first, create experiments with `lab-exp new` (never ad-hoc scripts), launch with `lab-exp run` (stamps git SHA/command/hardware for reproducibility; submits via SLURM on the CW cell), record outcomes with `lab-exp done`, mark overridden results with `lab-exp supersede` (never delete; 'mark as superseded/obsolete/defunct/replaced' means this), flag key results with `lab-exp important <id>` (a plain tag the DAG can star and filter to), and visualize through the shared `<pkg>/viz/` layer (`lab-exp viz` / `serve`). Core rules: experiments are APPEND-ONLY; shared code lives in ONE package (promotion ratchet: a second LINEAGE needs it → promote, generalized; within a lineage, load the ancestor's helper); never rewrite a method or visualizer that already exists — grep INDEX.md first. Also covers adopting lab-exp in a new/existing project (`lab-exp init`, see migration.md). Claude Code / codex on any lab machine."
 ---
 
 # lab-experiments — structured agentic experimentation
@@ -29,11 +29,10 @@ project/
 2. **INDEX + lineage before writing.** Before writing any non-trivial helper: (a) grep
    `<pkg>/INDEX.md` (everything already shared), then (b) grep your **ancestor experiments** —
    `lab-exp lineage <id>` prints the transitive `based_on` ancestry + dirs (cheap: your fork, not
-   all experiments — that is where reuse concentrates). If an ancestor already has the helper, that
-   is the **second use**: lift it into `<pkg>/`, `lab-exp index`, and import it from there in your
-   NEW experiment. Do NOT rewrite the finished ancestor — its local copy is part of its frozen,
-   reproducible record (rule 3; editing it also breaks its recorded SHA). `<pkg>/` is the home
-   going forward.
+   all experiments — that is where reuse concentrates). If an ancestor already has the helper,
+   LOAD it from there (`load_ancestor`, below) — do NOT copy it, and do NOT rewrite the ancestor
+   (its local copy is part of its frozen, reproducible record; editing it breaks its recorded SHA).
+   It moves into `<pkg>/` when a SECOND lineage needs it.
 
    **The unit of promotion is a FUNCTION or CLASS, never a file.** Copying run.py (or any script)
    into `<pkg>/` satisfies the letter of this rule while producing a junk drawer: main guards,
@@ -43,8 +42,18 @@ project/
    topic), and leave the experiment's script as a thin caller. `lab-exp index` and `doctor` flag
    script-shaped modules (main guard / argparse), modules nothing imports, and >600-line files —
    treat those warnings as YOUR refactoring queue, not noise, and fix the ones your promotion
-   introduced before finishing the task. Never import experiment→experiment (it couples two append-only experiments) —
-   reuse flows UP into the package, and finished experiments stay frozen.
+   introduced before finishing the task.
+
+   **A second use means a second LINEAGE.** A retry, a bug-fix rerun, or a `--based-on`
+   descendant of the same question is NOT a second use — it is the same question again. Promoting
+   on that basis is how packages fill with single-question code (an audit found a third of one
+   package promoted exactly this way). Reuse has two directions: **within a lineage, import your
+   ANCESTOR** — keep helpers in `<exp>/lib.py` (main-free) and load them from a descendant with
+   the template's `load_ancestor("<based_on id>")`; ancestors are frozen, so this couples you to
+   something immutable. **Across lineages, promote** — and promotion means generalizing (parameters,
+   not experiment ids or paths in code), never relocating. Never import a sibling or unrelated
+   experiment: `lab-exp run` refuses references to non-ancestor experiment ids, and `index`/`doctor`
+   flag package modules consumed by only one lineage or reaching experiment ids in code.
 
    Experiments form a **DAG**: `--based-on a,b` gives multiple parents. Query it in code (not by
    reading files): `lab-exp graph <id> --up|--down [--kind K] [--files] [--json]` returns

@@ -321,6 +321,57 @@ def _module_candidates(root, mod, from_file, level):
     return cands
 
 
+EXP_ID_RE = re.compile(r"\b\d{8}-[a-z0-9][a-z0-9-]*")
+
+
+def exp_id_literals(tree):
+    """Experiment ids mentioned in a module's CODE -- string constants, docstrings excluded.
+    Prose citations in docstrings are good (provenance); ids reached by code are coupling."""
+    doc_nodes = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                doc_nodes.add(id(body[0].value))
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in doc_nodes:
+            found.update(EXP_ID_RE.findall(node.value))
+    return found
+
+
+def ancestors_of(parents, eid):
+    """Transitive based_on ancestry (cycle-safe)."""
+    seen, stack = set(), list(parents.get(eid, []))
+    while stack:
+        a = stack.pop()
+        if a in seen:
+            continue
+        seen.add(a)
+        stack.extend(parents.get(a, []))
+    return seen
+
+
+def lineage_families(parents, eids):
+    """Collapse experiments into lineage families: two experiments are one family if they share a
+    based_on root. Retries, fixes, and descendants of one question count ONCE -- the denominator
+    the promotion rule actually cares about."""
+    roots = {}
+    for e in eids:
+        anc = ancestors_of(parents, e)
+        r = {a for a in anc if not parents.get(a)} or {e}
+        roots[e] = r
+    fam = []
+    for e, r in roots.items():
+        merged = [f for f in fam if f["roots"] & r]
+        new = {"roots": set(r), "members": {e}}
+        for f in merged:
+            new["roots"] |= f["roots"]; new["members"] |= f["members"]; fam.remove(f)
+        fam.append(new)
+    return fam
+
+
 def import_closure(root, entry):
     """Every in-repo .py file reachable from `entry` by following imports, transitively.
 
@@ -488,6 +539,8 @@ RUN_GENERIC = '''\
 
 Runs bare (`python run.py`) or stamped+registered via `lab-exp run {id}`.
 Import shared code from the project package — check {pkg}/INDEX.md before writing new methods.
+Reuse within your lineage: load_ancestor("<based_on id>") returns that experiment's lib.py
+(helpers it kept main-free); promote to {pkg}/ only when a SECOND lineage needs them.
 """
 import sys
 from pathlib import Path
@@ -496,6 +549,17 @@ EXP = Path(__file__).resolve().parent
 OUT = EXP / "out"
 ROOT = EXP.parent.parent
 sys.path.insert(0, str(ROOT))
+
+
+def load_ancestor(eid, module="lib"):
+    """Import a frozen ANCESTOR experiment's helper module by path (dir names start with digits,
+    so dotted import cannot). Only ancestors -- `lab-exp run` refuses anything else."""
+    import importlib.util
+    p = EXP.parent / eid / f"{{module}}.py"
+    spec = importlib.util.spec_from_file_location(f"anc_{{eid}}_{{module}}", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def main():
@@ -512,6 +576,8 @@ RUN_TRAINING = '''\
 
 Runs bare (`python run.py`) or stamped+registered via `lab-exp run {id}`.
 Import shared code from the project package — check {pkg}/INDEX.md before writing new methods.
+Reuse within your lineage: load_ancestor("<based_on id>") returns that experiment's lib.py
+(helpers it kept main-free); promote to {pkg}/ only when a SECOND lineage needs them.
 """
 import json
 import sys
@@ -521,6 +587,17 @@ EXP = Path(__file__).resolve().parent
 OUT = EXP / "out"
 ROOT = EXP.parent.parent
 sys.path.insert(0, str(ROOT))
+
+
+def load_ancestor(eid, module="lib"):
+    """Import a frozen ANCESTOR experiment's helper module by path (dir names start with digits,
+    so dotted import cannot). Only ancestors -- `lab-exp run` refuses anything else."""
+    import importlib.util
+    p = EXP.parent / eid / f"{{module}}.py"
+    spec = importlib.util.spec_from_file_location(f"anc_{{eid}}_{{module}}", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def main():
@@ -556,6 +633,17 @@ ROOT = EXP.parent.parent
 sys.path.insert(0, str(ROOT))
 
 SOURCE = ROOT / "experiments" / "{primary_parent}"   # first parent; see README based_on for all
+
+
+def load_ancestor(eid, module="lib"):
+    """Import a frozen ANCESTOR experiment's helper module by path (dir names start with digits,
+    so dotted import cannot). Only ancestors -- `lab-exp run` refuses anything else."""
+    import importlib.util
+    p = EXP.parent / eid / f"{{module}}.py"
+    spec = importlib.util.spec_from_file_location(f"anc_{{eid}}_{{module}}", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def main():
@@ -778,6 +866,19 @@ def cmd_run(a):
     # Walk the entry point's static import closure and require every in-repo file in it to be
     # TRACKED. dirty_ok deliberately does not excuse these: declaring scratch/ ignorable is fine,
     # importing code from it is not.
+    # Cross-experiment reuse is allowed ONLY upward: an ancestor in your based_on chain is frozen
+    # (rule 3) and reproduces at its SHA, so loading its helpers couples you to something
+    # immutable. A sibling or unrelated experiment is a moving target -- refuse.
+    _r, _parents, _c = graph_maps(root)
+    try:
+        refs = exp_id_literals(ast.parse((d / "run.py").read_text()))
+    except (OSError, SyntaxError):
+        refs = set()
+    foreign = sorted(x for x in refs if x != eid and x not in ancestors_of(_parents, eid) and x in _r)
+    if foreign and require_clean:
+        die(f"run.py references experiment(s) that are NOT ancestors of {eid}: {', '.join(foreign)}\n"
+            "  reuse flows UP a lineage (declare them in based_on) or INTO the package -- never "
+            "sideways.\n    [run] require_clean = false   opts out (migration-era repos)")
     missing_code = untracked_imports(root, Path(f"experiments/{eid}/run.py"))
     if missing_code and require_clean and not a.allow_dirty:
         shown = "\n".join("    " + p for p in missing_code[:12])
@@ -1714,10 +1815,15 @@ def pkg_health(root, cfg):
             parsed[f] = (src, ast.parse(src))
         except (SyntaxError, UnicodeDecodeError, OSError):
             continue
+    consumers = {}       # module -> set of consuming experiment ids
     for f in pkg_py + exp_py:
         if f not in parsed:
             continue
         tree = parsed[f][1]
+        try:
+            exp_of = f.relative_to(exps).parts[0] if exps.is_dir() and f.is_relative_to(exps) else None
+        except ValueError:
+            exp_of = None
         for node in ast.walk(tree):
             names = []
             if isinstance(node, ast.Import):
@@ -1738,6 +1844,9 @@ def pkg_health(root, cfg):
             for n in names:
                 if n == pname or n.startswith(pname + "."):
                     fanin[n] = fanin.get(n, 0) + 1
+                    if exp_of:
+                        consumers.setdefault(n, set()).add(exp_of)
+    _rows, parents, _children = graph_maps(root)
     warns = []
     for f in sorted(pkg_py):
         rel = f.relative_to(root)
@@ -1760,6 +1869,24 @@ def pkg_health(root, cfg):
             warns.append(f"{rel}: nothing in {pname}/ or experiments/ imports it — promoted as a "
                          "dumped file? Fold its useful functions into the module that owns the "
                          "topic, or delete it.")
+        # Promotion ratchet, measured the way it MEANS: a second use is a second LINEAGE. Retries,
+        # fixes, and based_on descendants of one question are one family -- the audit that
+        # motivated this found a third of one package promoted on exactly that basis.
+        cons = consumers.get(mod, set())
+        if cons:
+            fams = lineage_families(parents, cons)
+            if len(fams) == 1:
+                fam = fams[0]
+                root_desc = ", ".join(sorted(fam["roots"]))[:80]
+                warns.append(f"{rel}: consumed by {len(cons)} experiment(s) but ONE lineage (root: "
+                             f"{root_desc}) — promoted on retries of a single question? A second "
+                             "lineage is the bar; until then it belongs in the origin experiment, "
+                             "imported by descendants as an ancestor helper.")
+        ids_in_code = exp_id_literals(tree)
+        if ids_in_code:
+            warns.append(f"{rel}: experiment ids reached by CODE ({', '.join(sorted(ids_in_code))[:100]}) — "
+                         "the package is welded to specific experiments' outputs. Take the artifact "
+                         "as a parameter or an adopt-recorded input; cite ids in docstrings only.")
         n_lines = src.count("\n") + 1
         if n_lines > 600:
             warns.append(f"{rel}: {n_lines} lines — a module this size is usually several topics "
