@@ -158,8 +158,9 @@ function layout(ids, parentMap) {
     }
     if (!moved) break;
   }
-  const layers = [];
-  for (const id of ids) (layers[depth.get(id)] ||= []).push(id);
+  const sparse = [];
+  for (const id of ids) (sparse[depth.get(id)] ||= []).push(id);
+  const layers = sparse.filter(Boolean);           // depths need not be contiguous; holes would crash .sort()
   // ids sort chronologically (YYYYMMDD-slug), a sane starting order; then barycenter passes pull
   // children under their parents to cut edge crossings.
   layers.forEach(l => l.sort());
@@ -245,11 +246,24 @@ function repOf(id) {
   return (!showSup && SUP.has(cur)) ? null : cur; // cycle guard tripped: treat as dead end
 }
 let EFF = { parents, children };                  // effective adjacency of the CURRENT drawing
+const ANC = new Map();                            // real-DAG ancestor sets, memoized
+function ancestorsOf(id) {
+  if (ANC.has(id)) return ANC.get(id);
+  const seen = new Set(), stack = [...(parents.get(id) || [])];
+  while (stack.length) { const a = stack.pop(); if (seen.has(a)) continue; seen.add(a); stack.push(...(parents.get(a) || [])); }
+  ANC.set(id, seen);
+  return seen;
+}
 function effectiveEdges(SH) {
   const seen = new Map();                         // "p->c" -> {parent, child, synthetic}
   for (const e of EDGES) {
     const P = repOf(e.parent), C = repOf(e.child);
     if (!P || !C || P === C || !SH.has(P) || !SH.has(C)) continue;
+    // Cycle guard: a hidden node H with child G and successor S, where S was itself built on
+    // G (H -> G -> S, then H superseded by S), reroutes H->G into S->G and closes a loop. Such an
+    // edge is redundant (G already leads to S) -- drop it rather than hand layout a cycle, which
+    // it survives only by producing holes that crashed the whole page (FUS registry, 2026-09-02).
+    if (ancestorsOf(P).has(C)) continue;
     const k = P + "\u0000" + C, syn = P !== e.parent || C !== e.child;
     if (!seen.has(k) || !syn) seen.set(k, { parent: P, child: C, synthetic: seen.has(k) ? (seen.get(k).synthetic && syn) : syn });
   }
