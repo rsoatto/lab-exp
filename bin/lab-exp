@@ -518,11 +518,14 @@ produces: metrics.json
 # {title}
 
 ## Hypothesis
-<!-- 1-2 sentences: what question does this answer, and what do you expect? -->
+<!-- 1-2 plain sentences: the question this answers, and the outcome you expect and why.
+     A reader should be able to say what result would confirm it and what would refute it.
+     Write for a colleague who was not there: full words, define any project term you must use. -->
 
 ## Method
-<!-- What this run does, and how it differs from based_on. Reference {pkg}/ methods by name;
-     check {pkg}/INDEX.md BEFORE writing anything new. -->
+<!-- What this run does, in words, and the ONE thing it changes relative to based_on.
+     Name the {pkg}/ functions it calls (check {pkg}/INDEX.md BEFORE writing anything new).
+     Only the settings the result hinges on; the full config lives in run.py / out/run-meta.json. -->
 
 ## How to run
 
@@ -531,7 +534,9 @@ produces: metrics.json
 <!-- Document any extra args and what they mean. This section alone must suffice to reproduce. -->
 
 ## Result
-<!-- Filled when done (via `lab-exp done`): status, key metrics, finding, wandb link. -->
+<!-- Filled by `lab-exp done --finding`. Lead with the answer to the hypothesis in one sentence,
+     then the supporting number with its comparison and sample size, then caveats.
+     A conclusion, not a log. -->
 """
 
 RUN_GENERIC = '''\
@@ -2088,7 +2093,8 @@ def main():
     s = sub.add_parser("done", help="record outcome + finding")
     s.add_argument("id")
     s.add_argument("--status", default="done", choices=["done", "failed", "abandoned"])
-    s.add_argument("--finding", help="one-line finding for the registry")
+    s.add_argument("--finding", help="the finding, for the registry and README: answer the hypothesis in one plain "
+                   "sentence, then the supporting number with its comparison (e.g. '0.91 AUROC vs 0.87 baseline, 5 seeds')")
     s.add_argument("--metrics", help="k=v,k=v key scalars")
 
     s = sub.add_parser("adopt", help="declare an external artifact this experiment adopts (hash-recorded)")

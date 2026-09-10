@@ -1,6 +1,6 @@
 ---
 name: lab-experiments
-description: "How to structure and run experiments in any project managed with `lab-exp` (a `.lab-exp.toml` at the project root marks one). Use whenever you are about to train a model, run an ablation/sweep/analysis, write a plot, or add a method to a research codebase: check the registry and INDEX first, create experiments with `lab-exp new` (never ad-hoc scripts), launch with `lab-exp run` (stamps git SHA/command/hardware for reproducibility; submits via SLURM on the CW cell), record outcomes with `lab-exp done`, mark overridden results with `lab-exp supersede` (never delete; 'mark as superseded/obsolete/defunct/replaced' means this), flag key results with `lab-exp important <id>` (a plain tag the DAG can star and filter to), and visualize through the shared `<pkg>/viz/` layer (`lab-exp viz` / `serve`). Core rules: experiments are APPEND-ONLY; shared code lives in ONE package (promotion ratchet: a second LINEAGE needs it → promote, generalized; within a lineage, load the ancestor's helper); never rewrite a method or visualizer that already exists — grep INDEX.md first. Also covers adopting lab-exp in a new/existing project (`lab-exp init`, see migration.md). Claude Code / codex on any lab machine."
+description: "How to structure and run experiments in any project managed with `lab-exp` (a `.lab-exp.toml` at the project root marks one). Use whenever you are about to train a model, run an ablation/sweep/analysis, write a plot, or add a method to a research codebase: check the registry and INDEX first, create experiments with `lab-exp new` (never ad-hoc scripts), launch with `lab-exp run` (stamps git SHA/command/hardware for reproducibility; submits via SLURM on the CW cell), record outcomes with `lab-exp done`, mark overridden results with `lab-exp supersede` (never delete; 'mark as superseded/obsolete/defunct/replaced' means this), flag key results with `lab-exp important <id>` (a plain tag the DAG can star and filter to), and visualize through the shared `<pkg>/viz/` layer (`lab-exp viz` / `serve`). Core rules: experiments are APPEND-ONLY; shared code lives in ONE package (promotion ratchet: a second LINEAGE needs it → promote, generalized; within a lineage, load the ancestor's helper); never rewrite a method or visualizer that already exists — grep INDEX.md first. READMEs, findings and reports are written in plain sentences for a reader who was not there (rule 5). Also covers adopting lab-exp in a new/existing project (`lab-exp init`, see migration.md). Claude Code / codex on any lab machine."
 ---
 
 # lab-experiments — structured agentic experimentation
@@ -22,7 +22,7 @@ project/
     20260720-slug/         # ONE experiment: README.md (hypothesis/method/how-to-run) + run.py + out/
 ```
 
-## The four rules
+## The five rules
 
 1. **Registry before running.** `lab-exp list` (and the lineage in `based_on`) — has this
    experiment, or its answer, already been run? Don't repeat work; fork it with `--based-on`.
@@ -81,6 +81,25 @@ project/
    `out/viz/<name>.html` for additional views. The DAG page surfaces every .html at out/ top level
    or one subdir deep (▤ marker on the node, links in the panel, primary first). (A published
    lab-report page can simply also be saved there.) Reproduce an old experiment at its recorded SHA via `git worktree`.
+5. **Write the README and reports for a reader who was not there.** The README and the
+   recorded finding are read far more often than the code, usually by someone who does not have
+   the run in their head (often you, months later). Precise does not mean dense. Plain sentences,
+   full words, and one idea per sentence. Explain a project-specific term or abbreviation the
+   first time it appears, or avoid it; assume a competent colleague from a neighbouring lab.
+   - **Hypothesis**: one or two sentences. The question, and the outcome you expect and why.
+     "Does removing the cell-size covariate change which genes rank in the top 20? Expected: mostly
+     not, because size explains little variance after normalisation." A reader should be able to say
+     what result would confirm it and what would refute it.
+   - **Method**: what this run does, in words, and the ONE thing it changes relative to `based_on`.
+     Name the package functions it calls. List only the settings the result hinges on; the full
+     configuration lives in run.py and out/run-meta.json, not in prose.
+   - **Result / finding**: lead with the answer to the hypothesis in one sentence. Then the number
+     that supports it, with its comparison and sample size ("0.91 AUROC vs 0.87 for the baseline,
+     5 seeds"). Then caveats. It is a conclusion, not a log of what happened.
+   - **Reports**: same rules. Headings are questions or conclusions, not variable names. Every
+     figure has a caption saying what to look at and what it shows. Define axes and colours.
+   The test: could that colleague read the README top to bottom and tell you what was asked, what
+   was done, and what was found, without opening the code? If not, rewrite it.
 
 ## Workflow
 
