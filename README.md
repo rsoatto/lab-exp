@@ -11,9 +11,11 @@ source of truth.
   refuses if run.py imports untracked code — including .gitignore'd modules git
   status can't see), exact command, host, GPUs. `--allow-dirty` records the
   diff + untracked imports so SHA+patch still reconstructs the tree.
-- **The registry TSV is the truth**: id · kind · status · tags · SHA · metrics
-  · finding. Concurrent-safe (flock). `done` records the finding; `supersede`
-  marks overridden results without deleting; `important` stars key ones.
+- **README front-matter is the record; the registry TSV is a cache** derived
+  from it (`lab-exp registry --rebuild`), so contributors who don't use lab-exp
+  only need front-matter (and `command:` if they launch their own way).
+  Concurrent-safe (flock). `done` records the finding; `supersede` marks
+  overridden results without deleting; `important` stars key ones.
 - **`lab-exp dag`** renders the whole experiment DAG as one self-contained
   interactive HTML page (search, superseded hiding, per-experiment reports
   from `out/*.html`). `--serve` makes it live: click to supersede/star.

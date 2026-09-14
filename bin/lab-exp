@@ -125,18 +125,163 @@ def reg_path(root):
     return root / "experiments" / "_registry.tsv"
 
 
-def reg_read(root):
+def reg_read(root, derive=True):
+    """Registry rows. The TSV is a CACHE of facts that live in each experiment's README
+    front-matter (see front_update/row_from_readme): any experiment directory with front-matter
+    but no cached row is derived on the fly, so a collaborator's hand-made experiment, or a fresh
+    clone where the TSV is gitignored, is visible to every command without a rebuild step.
+    derive=False returns the cache alone (doctor uses it to report what is derived-only)."""
     rows = []
     f = reg_path(root)
-    if not f.is_file():
-        return rows
-    for line in f.read_text().splitlines()[1:]:
-        if not line.strip():
-            continue
-        vals = line.split("\t")
-        vals += [""] * (len(REG_COLS) - len(vals))
-        rows.append(dict(zip(REG_COLS, vals)))
+    if f.is_file():
+        for line in f.read_text().splitlines()[1:]:
+            if not line.strip():
+                continue
+            vals = line.split("\t")
+            vals += [""] * (len(REG_COLS) - len(vals))
+            rows.append(dict(zip(REG_COLS, vals)))
+    if derive:
+        have = {r["id"] for r in rows}
+        for d in exp_dirs(root):
+            if d.name not in have:
+                r = row_from_readme(d)
+                if r:
+                    rows.append(r)
     return rows
+
+
+def exp_dirs(root):
+    exps = root / "experiments"
+    if not exps.is_dir():
+        return []
+    return sorted(p for p in exps.iterdir() if p.is_dir() and not p.name.startswith("_"))
+
+
+# Registry-owned facts that are mirrored into README front-matter on every registry write, and
+# read back by row_from_readme. kind/tags/based_on are AUTHORED in the front-matter already.
+FRONT_KEYS = ["status", "date", "agent", "host", "git_sha", "metrics", "finding", "wandb", "superseded_by"]
+
+
+def front_update(readme, updates):
+    """Additive edit of a README's front-matter block: set or replace `key: value` lines, drop a
+    key whose value is empty. The body is never touched; a README without front-matter is left
+    alone (returns False). This is the ONE writer of registry facts into READMEs."""
+    if not readme.is_file():
+        return False
+    lines = readme.read_text().splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return False
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return False
+    block = [l if l.endswith("\n") else l + "\n" for l in lines[1:end]]
+    changed = False
+    for k, v in updates.items():
+        v = "" if v is None else str(v).replace("\n", " ").replace("\t", " ").strip()
+        idx = next((i for i, l in enumerate(block) if ":" in l and l.split(":", 1)[0].strip() == k), None)
+        if v == "":
+            if idx is not None:
+                block.pop(idx)
+                changed = True
+            continue
+        new = f"{k}: {v}\n"
+        if idx is None:
+            block.append(new)
+            changed = True
+        elif block[idx] != new:
+            block[idx] = new
+            changed = True
+    if changed:
+        readme.write_text("".join(lines[:1] + block + lines[end:]))
+    return changed
+
+
+def front_mirror(root, row, full=False):
+    """Mirror a registry row's facts into its README. full=False (upsert semantics) writes only
+    non-empty facts; full=True (reg_edit semantics) also REMOVES keys the row has cleared and
+    rewrites tags (that is how `important` toggles reach the README)."""
+    readme = root / "experiments" / row["id"] / "README.md"
+    upd = {k: row.get(k, "") for k in FRONT_KEYS if full or row.get(k, "")}
+    if full:
+        fm = read_front(readme)
+        if set(split_list(fm.get("tags", ""))) != set(split_list(row.get("tags", ""))):
+            upd["tags"] = ", ".join(split_list(row.get("tags", ""))) or "none"
+    return front_update(readme, upd)
+
+
+def result_recorded(readme):
+    """True when the README's `## Result` section has real content (not just the template
+    comment) -- the signal that a hand-made experiment is finished."""
+    if not readme.is_file():
+        return False
+    txt = readme.read_text()
+    m = re.search(r"^## Result[^\n]*\n(.*?)(?=^## |\Z)", txt, re.S | re.M)
+    if not m:
+        return False
+    body = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
+    return bool(body.strip())
+
+
+def metrics_from_json(d):
+    f = d / "out" / "metrics.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return ",".join(f"{k}={v}" for k, v in data.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool))
+
+
+def row_from_readme(d):
+    """A registry row derived purely from an experiment directory: README front-matter first,
+    out/metrics.json for metrics when the front-matter has none. None when there is no
+    front-matter (that IS the shared contract; doctor warns about it). Status is inferred for
+    experiments that never went through lab-exp: done when a Result section or metrics exist,
+    else unknown."""
+    fm = read_front(d / "README.md")
+    if not fm:
+        return None
+    row = {c: fm.get(c, "") for c in REG_COLS}
+    row["id"] = d.name
+    row["tags"] = ",".join(split_list(fm.get("tags", "")))
+    row["based_on"] = ",".join(split_list(fm.get("based_on", "")))
+    row["metrics"] = ",".join(split_list(fm.get("metrics", ""))) or metrics_from_json(d)
+    if not row["date"]:
+        m = re.match(r"(\d{4})(\d{2})(\d{2})-", d.name)
+        row["date"] = f"{m[1]}-{m[2]}-{m[3]}" if m else ""
+    if not row["status"]:
+        row["status"] = "done" if (result_recorded(d / "README.md") or row["metrics"]) else "unknown"
+    return row
+
+
+def reg_rebuild(root):
+    """Every row, derived from READMEs alone (what `registry --rebuild` writes)."""
+    return [r for r in (row_from_readme(d) for d in exp_dirs(root)) if r]
+
+
+def reg_sync(root, dry_run=False):
+    """Push cached facts a README does not carry yet into its front-matter (additive: an existing
+    front-matter value always wins; tags are unioned so `important` survives). This is the
+    one-time migration for projects whose facts so far lived only in the TSV; afterwards every
+    write mirrors itself. Returns [(id, keys_written)]."""
+    out = []
+    for r in reg_read(root, derive=False):
+        readme = root / "experiments" / r["id"] / "README.md"
+        fm = read_front(readme)
+        if not fm:
+            continue
+        upd = {k: r[k] for k in FRONT_KEYS if r.get(k, "") and not fm.get(k, "")}
+        have, want = split_list(fm.get("tags", "")), split_list(r.get("tags", ""))
+        extra = [t for t in want if t not in have]
+        if extra:
+            upd["tags"] = ", ".join(have + extra)
+        if upd:
+            out.append((r["id"], sorted(upd)))
+            if not dry_run:
+                front_update(readme, upd)
+    return out
 
 
 @contextlib.contextmanager
@@ -170,11 +315,12 @@ def reg_upsert(root, row):
         rows = reg_read(root)
         for i, r in enumerate(rows):
             if r["id"] == row["id"]:
-                rows[i] = {**r, **{k: v for k, v in row.items() if v != ""}}
+                rows[i] = merged = {**r, **{k: v for k, v in row.items() if v != ""}}
                 break
         else:
-            rows.append({c: row.get(c, "") for c in REG_COLS})
+            rows.append(merged := {c: row.get(c, "") for c in REG_COLS})
         reg_write(root, rows)
+        front_mirror(root, merged)
 
 
 # ---------------------------------------------------------------- experiments
@@ -735,6 +881,14 @@ def cmd_init(a):
     exps.mkdir(exist_ok=True)
     if not reg_path(root).exists():
         reg_write(root, [])
+    # The TSV is a rebuildable cache of README facts; keep it out of git so contributors who
+    # don't use lab-exp never see it churn (existing repos: see migration.md).
+    gi = root / ".gitignore"
+    have = gi.read_text() if gi.is_file() else ""
+    add = [l for l in ("experiments/_registry.tsv", "experiments/_registry.tsv.lock") if l not in have]
+    if add:
+        with open(gi, "a") as fh:
+            fh.write(("" if not have or have.endswith("\n") else "\n") + "\n".join(add) + "\n")
     (exps / "_templates").mkdir(exist_ok=True)
     vz = root / pkg / "viz"
     vz.mkdir(exist_ok=True)
@@ -874,9 +1028,15 @@ def cmd_run(a):
     # Cross-experiment reuse is allowed ONLY upward: an ancestor in your based_on chain is frozen
     # (rule 3) and reproduces at its SHA, so loading its helpers couples you to something
     # immutable. A sibling or unrelated experiment is a moving target -- refuse.
+    # `command:` in the README front-matter replaces `python experiments/<id>/run.py` (run with
+    # cwd = the experiment dir) for experiments that launch their own way -- a collaborator's
+    # submit.sh, an sbatch array. Everything around it (env, activate, hardware stamp, run.log,
+    # the dirty-tree refusal, run-meta.json) is unchanged; the static import walk below is only
+    # meaningful for the run.py form, so a custom command is recorded verbatim instead.
+    custom = meta.get("command", "").strip()
     _r, _parents, _c = graph_maps(root)
     try:
-        refs = exp_id_literals(ast.parse((d / "run.py").read_text()))
+        refs = exp_id_literals(ast.parse((d / "run.py").read_text())) if not custom else set()
     except (OSError, SyntaxError):
         refs = set()
     foreign = sorted(x for x in refs if x != eid and x not in ancestors_of(_parents, eid) and x in _r)
@@ -884,7 +1044,7 @@ def cmd_run(a):
         die(f"run.py references experiment(s) that are NOT ancestors of {eid}: {', '.join(foreign)}\n"
             "  reuse flows UP a lineage (declare them in based_on) or INTO the package -- never "
             "sideways.\n    [run] require_clean = false   opts out (migration-era repos)")
-    missing_code = untracked_imports(root, Path(f"experiments/{eid}/run.py"))
+    missing_code = [] if custom else untracked_imports(root, Path(f"experiments/{eid}/run.py"))
     if missing_code and require_clean and not a.allow_dirty:
         shown = "\n".join("    " + p for p in missing_code[:12])
         die(f"run.py imports {len(missing_code)} file(s) git is NOT tracking — the stamped SHA "
@@ -916,8 +1076,10 @@ def cmd_run(a):
     extra = a.args or []
     if extra and extra[0] == "--":
         extra = extra[1:]
+    launch = custom or f"python experiments/{eid}/run.py"
     run_meta = dict(
-        id=eid, command=f"python experiments/{eid}/run.py" + ("".join(" " + x for x in extra)),
+        id=eid, command=launch + ("".join(" " + x for x in extra)),
+        **({"command_source": "README front-matter", "cwd": str(d)} if custom else {}),
         git_sha=sha, git_dirty=dirty,
         # Present only when dirty, so a clean run's meta stays uncluttered. dirty_untracked is the
         # honest caveat: those files are in NEITHER the SHA nor the patch.
@@ -936,7 +1098,8 @@ def cmd_run(a):
     inner = (f"cd {sh_q(str(root))} && {wandb_src}{exports}"
              + (f"{activate} && " if activate else "")
              + f"lab-exp _stamp-hw {sh_q(str(d))} ; "
-             + f"set -o pipefail; python experiments/{eid}/run.py"
+             + (f"cd {sh_q(str(d))} && " if custom else "")
+             + f"set -o pipefail; {launch}"
              + "".join(" " + sh_q(x) for x in extra)
              + f" 2>&1 | tee -a {sh_q(str(d / 'out' / 'run.log'))}")
     launcher = cfg["run"].get("launcher", "local")
@@ -1070,6 +1233,7 @@ def reg_edit(root, eid, mutate):
         for r in rows:
             if r["id"] == eid:
                 mutate(r)
+                front_mirror(root, r, full=True)
         reg_write(root, rows)
 
 
@@ -1571,6 +1735,40 @@ def cmd_list(a):
         print(line)
 
 
+def cmd_registry(a):
+    """The TSV is a cache; READMEs are the record. --sync pushes cached facts into READMEs that
+    lack them (one-time, for projects older than this), --rebuild regenerates the TSV from READMEs
+    alone (after syncing, so nothing is lost). No flag: report what a rebuild would change."""
+    root = find_root(a.root)
+    if a.sync or a.rebuild:
+        synced = reg_sync(root, dry_run=a.dry_run)
+        for eid, keys in synced:
+            print(f"  {'would write' if a.dry_run else 'wrote'} {eid}: {', '.join(keys)}")
+        print(f"sync: {len(synced)} README(s) {'need' if a.dry_run else 'received'} cached facts")
+        if not a.rebuild:
+            return
+    old = {r["id"]: r for r in reg_read(root, derive=False)}
+    new = {r["id"]: r for r in reg_rebuild(root)}
+    added = sorted(set(new) - set(old))
+    dropped = sorted(set(old) - set(new))
+    changed = sorted(i for i in set(old) & set(new)
+                     if any(old[i].get(c, "") != new[i].get(c, "") for c in REG_COLS if c != "tags")
+                     or set(split_list(old[i].get("tags", ""))) != set(split_list(new[i].get("tags", ""))))
+    for i in added:
+        print(f"  + {i}  (status={new[i]['status']})")
+    for i in dropped:
+        print(f"  - {i}  (in cache, but no README front-matter -- kept nowhere after a rebuild)")
+    for i in changed:
+        diff = [c for c in REG_COLS if old[i].get(c, "") != new[i].get(c, "")]
+        print(f"  ~ {i}  ({', '.join(diff)})")
+    verb = "rebuild" if a.rebuild and not a.dry_run else "rebuild would change"
+    print(f"{verb}: {len(new)} row(s) from READMEs; +{len(added)} -{len(dropped)} ~{len(changed)} vs cache")
+    if a.rebuild and not a.dry_run:
+        with reg_lock(root):
+            reg_write(root, list(new.values()))
+        print(f"wrote {reg_path(root).relative_to(root)}")
+
+
 def cmd_projects(a):
     if not PROJECTS_TSV.is_file():
         print("(no lab-exp projects registered on this machine)")
@@ -1962,10 +2160,18 @@ def cmd_doctor(a):
         warn(msg)
 
     rows = {r["id"]: r for r in reg_read(root)}
+    cached = {r["id"] for r in reg_read(root, derive=False)}
     dirs = {p.name: p for p in (root / "experiments").iterdir()
             if p.is_dir() and not p.name.startswith("_")}
-    for eid in sorted(set(dirs) - set(rows)):
-        flag(f"{eid}: directory exists but not in _registry.tsv (created without `lab-exp new`?)")
+    # Experiments made by hand (a collaborator who does not use lab-exp) are FINE as long as they
+    # carry front-matter: their rows are derived from it. One informational line, never an issue.
+    derived = sorted(set(dirs) & set(rows) - cached)
+    if derived:
+        print(f"  note {len(derived)} experiment(s) not in the registry cache -- rows derived from "
+              f"their README front-matter: {', '.join(derived[:6])}{' …' if len(derived) > 6 else ''}"
+              "  (`lab-exp registry --rebuild` writes them)")
+    foreign = {eid for eid in dirs if not (dirs[eid] / "out" / "run-meta.json").is_file()
+               and not any(read_front(dirs[eid] / "README.md").get(k) for k in ("agent", "git_sha"))}
     for eid in sorted(set(rows) - set(dirs)):
         flag(f"{eid}: in registry but directory missing (experiments are append-only — was it deleted?)")
     kinds = cfg["project"].get("kinds", [])
@@ -1984,8 +2190,11 @@ def cmd_doctor(a):
         arts = out_artifacts(out)
         backfilled = str(meta.get("backfilled", "")).lower() in ("true", "1", "yes")
         if arts and not (out / "run-meta.json").is_file() and not backfilled:
-            flag(f"{eid}: out/ has artifacts but no run-meta.json — run bypassed `lab-exp run` (not stamped; "
-                 "if this is a documented legacy backfill, add `backfilled: true` to its README frontmatter)")
+            if eid in foreign:
+                print(f"  note {eid}: not run through lab-exp (no run-meta.json; nothing stamped)")
+            else:
+                flag(f"{eid}: out/ has artifacts but no run-meta.json — run bypassed `lab-exp run` (not stamped; "
+                     "if this is a documented legacy backfill, add `backfilled: true` to its README frontmatter)")
         row = rows.get(eid, {})
         if row.get("status") == "running":
             metaj = out / "run-meta.json"
@@ -2154,6 +2363,11 @@ def main():
     s.add_argument("--stop")
     s.add_argument("--force", action="store_true")
 
+    s = sub.add_parser("registry", help="the TSV cache vs the READMEs it is derived from: --rebuild regenerates it")
+    s.add_argument("--rebuild", action="store_true", help="regenerate experiments/_registry.tsv from README front-matter (syncs first)")
+    s.add_argument("--sync", action="store_true", help="write cached facts into READMEs that lack them (additive)")
+    s.add_argument("--dry-run", action="store_true", help="report only; write nothing")
+
     sub.add_parser("index", help="regenerate the package INDEX.md")
     sub.add_parser("doctor", help="drift checks")
     sub.add_parser("projects", help="list lab-exp projects on this machine")
@@ -2166,7 +2380,7 @@ def main():
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
      "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
-     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects,
+     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
 
 

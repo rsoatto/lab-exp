@@ -7,7 +7,8 @@ description: "How to structure and run experiments in any project managed with `
 
 A lab-exp project separates **shared code** (one importable package: methods, models, training
 loops, visualizers) from **experiments** (append-only directories, each one reproducible from its
-own README). The registry TSV is the agent-facing truth; wandb is the human live-metrics layer;
+own README). Each experiment's README front-matter is the record; the registry TSV is a cache
+derived from it (`lab-exp registry --rebuild` regenerates it); wandb is the human live-metrics layer;
 `lab-report` pages compose visualizer renders. `lab-exp` is on PATH everywhere.
 
 ```
@@ -17,7 +18,7 @@ project/
     INDEX.md               #   auto-generated map of methods + visualizers — READ THIS FIRST
     viz/                   #   visualizers: declare REQUIRES/MATCH/KIND, implement render()/serve()
   experiments/
-    _registry.tsv          # id · kind · status · tags · git SHA · metrics · finding · wandb — the truth
+    _registry.tsv          # CACHE of the READMEs' front-matter (status · tags · SHA · metrics · finding …); rebuildable, gitignored
     _templates/<kind>/     # per-kind scaffolds used by `lab-exp new` (optional; built-ins otherwise)
     20260720-slug/         # ONE experiment: README.md (hypothesis/method/how-to-run) + run.py + out/
 ```
@@ -111,6 +112,7 @@ lab-exp run 20260720-my-idea                   # local box: runs+logs; CW cell: 
 lab-exp done 20260720-my-idea --finding "X improves Y by 12%" --metrics acc=0.91
 lab-exp supersede 20260701-old --by 20260720-my-idea --why "..."   # overridden, NOT deleted
 lab-exp doctor                                 # drift check — run when things look off
+lab-exp registry --rebuild                     # regenerate the TSV cache from READMEs (after a pull, or when it looks stale)
 ```
 **`run` REFUSES on a dirty git tree.** The stamped SHA would not reproduce the run, and the
 experiment record is append-only — there is no fixing it afterwards. Commit first. If you genuinely
@@ -222,6 +224,27 @@ Configured entirely by `lab-exp run` env vars: run name/id = experiment id, grou
 (forks group together), tags = experiment tags + kind. Code calls `wandb.init()` with no args.
 No auth on the box → automatic `WANDB_MODE=offline` (the user drops a key in
 `~/.config/lab/wandb.env` to go online — never print or sync that file).
+
+## Sharing a repo with people who don't use lab-exp
+
+lab-exp is optional per contributor. The only shared contract is the **README front-matter**
+(`id`, `kind`, `tags`, `based_on`, `produces`, …); everything lab-exp records (`status`, `date`,
+`git_sha`, `metrics`, `finding`, `superseded_by`, …) is written into that same block, additively,
+never touching the body. Consequences:
+
+- **The registry TSV is a cache, not a record.** New projects gitignore it; `lab-exp registry
+  --rebuild` regenerates it from the READMEs (and `--sync` first pushes older cached facts into
+  READMEs that lack them, so nothing is lost). `list`/`dag`/`graph`/`doctor` also pick up any
+  experiment directory with front-matter but no cached row automatically -- a collaborator's
+  hand-made experiment appears with `status` inferred (`done` when its README has a filled
+  `## Result` section or `out/metrics.json`, else `unknown`).
+- **`command:` in the front-matter** (e.g. `command: bash submit.sh`) is what `lab-exp run` launches
+  instead of `python run.py`, with the experiment directory as cwd and the same env / activate /
+  hardware stamp / `out/run.log` / dirty-tree refusal / `run-meta.json` around it. Use it for an
+  experiment that submits its own sbatch array or has no run.py; `lab-exp new` still scaffolds run.py.
+- **`doctor` does not fail on hand-made experiments.** Missing cache rows and un-stamped `out/`
+  on an experiment lab-exp never ran are `note` lines, not issues. A README with no front-matter
+  is still a WARN: that is the contract everyone shares.
 
 ## Adopting lab-exp in a project
 
