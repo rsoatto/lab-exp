@@ -2050,6 +2050,9 @@ def pkg_health(root, cfg):
                     if exp_of:
                         consumers.setdefault(n, set()).add(exp_of)
     _rows, parents, _children = graph_maps(root)
+    # A project with a SINGLE lineage family (every experiment descends from one root) cannot
+    # have a "second lineage" yet, so the promotion-ratchet warning below is pure noise there.
+    one_family = len(lineage_families(parents, set(parents))) < 2
     warns = []
     for f in sorted(pkg_py):
         rel = f.relative_to(root)
@@ -2078,7 +2081,7 @@ def pkg_health(root, cfg):
         cons = consumers.get(mod, set())
         if cons:
             fams = lineage_families(parents, cons)
-            if len(fams) == 1:
+            if len(fams) == 1 and not one_family:
                 fam = fams[0]
                 root_desc = ", ".join(sorted(fam["roots"]))[:80]
                 warns.append(f"{rel}: consumed by {len(cons)} experiment(s) but ONE lineage (root: "

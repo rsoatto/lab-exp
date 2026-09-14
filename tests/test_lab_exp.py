@@ -237,5 +237,24 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("DIRTY", r.stderr)
 
 
+    # ---- promotion heuristic vs single-lineage projects ------------------------------------
+
+    def test_single_lineage_project_gets_no_promotion_warning(self):
+        self.p.init()
+        (self.p.root / "lib" / "helper.py").write_text("def f():\n    return 1\n")
+        a = self.p.new("base")
+        b = self.p.new("child", based_on=a)
+        for eid in (a, b):
+            (self.p.root / "experiments" / eid / "run.py").write_text("from lib.helper import f\nf()\n")
+        self.p.run("index")
+        out = self.p.run("doctor", check=False).stdout
+        self.assertNotIn("ONE lineage", out)
+        c = self.p.new("other-root")                       # a second, unrelated lineage
+        (self.p.root / "experiments" / c / "run.py").write_text("import os\n")
+        (self.p.root / "experiments" / a / "run.py").write_text("from lib.helper import f\n")
+        out = self.p.run("doctor", check=False).stdout
+        self.assertIn("ONE lineage", out)                  # now a second lineage exists but does not use it
+
+
 if __name__ == "__main__":
     unittest.main()
