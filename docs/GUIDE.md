@@ -88,7 +88,9 @@ project/
    project's DAG and every `out/*.html` on the user's phone, so a separately published page is a
    duplicate that drifts. The hub's DAG pages also carry the supersede / important buttons: a mark made
    there is queued in the browser and submitted as a GitHub issue, which the publisher applies
-   with `lab-exp intents` on its next run. Build it with the same static-HTML craft (self-contained, Vega-Lite /
+   with `lab-exp intents` on its next run. The hub republishes within a couple of minutes of any
+   registry write (`new`, `run`, `done`, `supersede`, `important`), so a finished experiment is on
+   the phone by the time you report it. Build it with the same static-HTML craft (self-contained, Vega-Lite /
    Plotly / inline SVG, KPI cards, no runtime); tell the user the experiment id, not a URL.
    Reproduce an old experiment at its recorded SHA via `git worktree`.
 5. **Write the README and reports for a reader who was not there.** The README and the

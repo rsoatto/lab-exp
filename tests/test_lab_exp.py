@@ -322,5 +322,21 @@ class LabExpTests(unittest.TestCase):
         self.assertIn('const INTENTS = "";', (site / "proj" / "index.html").read_text())
 
 
+    # ---- hub change signal ---------------------------------------------------------------------
+
+    def test_registry_writes_signal_the_hub(self):
+        self.p.init()
+        dirty = self.p.home / ".config" / "lab" / "hub.dirty"
+        self.assertTrue(dirty.is_file())
+        t0 = dirty.read_text()
+        a = self.p.new("base")
+        t1 = dirty.read_text()
+        self.assertNotEqual(t0, t1)
+        self.p.run("done", a, "--finding", "works")
+        self.assertNotEqual(t1, dirty.read_text())
+        self.p.run("list")                                  # reads never signal
+        self.assertEqual(self.p.run("list").stdout, self.p.run("list").stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

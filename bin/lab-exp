@@ -49,6 +49,11 @@ REG_COLS = ["id", "date", "kind", "status", "agent", "host", "git_sha",
 PROJECTS_TSV = Path.home() / ".config" / "lab" / "exp-projects.tsv"
 SERVES_TSV = Path.home() / ".config" / "lab" / "exp-serves.tsv"
 WANDB_ENV = Path.home() / ".config" / "lab" / "wandb.env"
+# Change signal for the hub publisher (lab-exp-hub): every registry write drops a fresh token
+# here; the publisher republishes when the token differs from the one it last published. A
+# token, not an mtime: the fleet's clocks disagree by up to an hour, and on the NFS home this
+# one file is shared by every box.
+HUB_DIRTY = Path.home() / ".config" / "lab" / "hub.dirty"
 
 
 # ---------------------------------------------------------------- config
@@ -309,6 +314,16 @@ def reg_write(root, rows):
         os.replace(tmp, f)
     finally:
         tmp.unlink(missing_ok=True)
+    hub_touch()
+
+
+def hub_touch():
+    try:
+        HUB_DIRTY.parent.mkdir(parents=True, exist_ok=True)
+        HUB_DIRTY.write_text(f"{os.urandom(8).hex()} {datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+                             f"{socket.gethostname().split('.')[0]}\n")
+    except OSError:
+        pass          # a missing signal costs a slower hub refresh, never a failed command
 
 
 def reg_upsert(root, row):
