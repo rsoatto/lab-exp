@@ -27,6 +27,7 @@ import contextlib
 import fcntl
 import fnmatch
 from collections import deque
+import html as _html
 import json
 import os
 import re
@@ -36,7 +37,7 @@ import socket
 import subprocess
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 CONFIG_NAME = ".lab-exp.toml"
@@ -1769,6 +1770,93 @@ def cmd_registry(a):
         print(f"wrote {reg_path(root).relative_to(root)}")
 
 
+HUB_INDEX = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>lab-exp hub</title>
+<style>body{font:15px/1.45 -apple-system,system-ui,sans-serif;margin:0;padding:20px;background:#fafafa;color:#111}
+h1{font-size:20px;margin:0 0 4px}.sub{color:#666;font-size:13px;margin:0 0 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+a.card{display:block;border:1px solid #ddd;border-radius:10px;padding:14px 16px;background:#fff;text-decoration:none;color:inherit}
+a.card:hover{border-color:#888}.name{font-weight:600;font-size:16px}.meta{color:#666;font-size:13px;margin-top:6px}
+.n{font-variant-numeric:tabular-nums}.recent{margin-top:8px;font-size:13px}.recent li{margin:2px 0}</style>
+<h1>lab-exp hub</h1><p class="sub">{machine} · generated {when}. Click a project for its experiment DAG; reports open from a node's panel.</p>
+<div class="grid">{cards}</div>"""
+
+
+def cmd_hub(a):
+    """A STATIC multi-project site: an index of every lab-exp project registered on this machine,
+    one DAG page per project, and every experiment report (out/*.html, one subdir deep) copied
+    beside it so the DAG's report links work. Hand the directory to a publisher (the lab's
+    `lab-exp-hub` wraps lab-report) and the whole lab is one phone-openable URL.
+
+      lab-exp hub --out DIR [--max-mb 25] [--projects ROOT,ROOT...]
+    """
+    out = Path(a.out).resolve()
+    cap = float(a.max_mb) * 1024 * 1024
+    roots = []
+    if a.projects:
+        roots = [Path(r).resolve() for r in split_list(a.projects)]
+    elif PROJECTS_TSV.is_file():
+        for line in PROJECTS_TSV.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) > 1 and (Path(parts[1]) / CONFIG_NAME).is_file():
+                roots.append(Path(parts[1]).resolve())
+    roots = sorted(set(roots))
+    if not roots:
+        die("no lab-exp projects found (none registered in " + str(PROJECTS_TSV) + ", or pass --projects)")
+    out.mkdir(parents=True, exist_ok=True)
+    cards, week = [], (date.today() - timedelta(days=7)).isoformat()
+    for root in roots:
+        cfg = load_cfg(root)
+        name = cfg["project"].get("name") or root.name
+        slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "project"
+        pdir = out / slug
+        if pdir.exists():
+            shutil.rmtree(pdir)
+        pdir.mkdir(parents=True)
+        (pdir / "index.html").write_text(dag_html(root))
+        rows = reg_read(root)
+        n_rep, n_big = 0, 0
+        for r in rows:
+            outd = root / "experiments" / r["id"] / "out"
+            try:
+                reps = list(outd.glob("*.html")) + list(outd.glob("*/*.html"))
+            except OSError:
+                reps = []
+            for q in reps[:20]:
+                dst = pdir / "experiments" / r["id"] / "out" / q.relative_to(outd)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    size = q.stat().st_size
+                    if size > cap:
+                        n_big += 1
+                        dst.write_text(f"<!doctype html><meta charset='utf-8'><title>{r['id']}</title>"
+                                       f"<p style='font:15px system-ui;padding:20px'>This report is "
+                                       f"{size / 1048576:.0f} MB, above the hub's {a.max_mb} MB cap. Open it on "
+                                       f"{socket.gethostname().split('.')[0]}: <code>{q}</code></p>")
+                    else:
+                        shutil.copyfile(q, dst)
+                        n_rep += 1
+                except OSError as e:
+                    warn(f"{r['id']}/{q.relative_to(outd)}: {e}")
+        recent = sorted((r for r in rows if r.get("date", "") >= week and r.get("finding")),
+                        key=lambda r: r["date"], reverse=True)[:3]
+        rec = "".join(f"<li>{_html.escape(r['id'])}: {_html.escape(r['finding'][:110])}</li>" for r in recent)
+        by_status = {}
+        for r in rows:
+            by_status[r.get("status", "")] = by_status.get(r.get("status", ""), 0) + 1
+        st = ", ".join(f"{v} {k}" for k, v in sorted(by_status.items(), key=lambda kv: -kv[1]))
+        cards.append(f'<a class="card" href="{slug}/"><div class="name">{_html.escape(name)}</div>'
+                     f'<div class="meta"><span class="n">{len(rows)}</span> experiments ({_html.escape(st)}) · '
+                     f'<span class="n">{n_rep}</span> reports{f" · {n_big} too large" if n_big else ""}'
+                     f'<br>{_html.escape(str(root))}</div>'
+                     + (f'<ul class="recent">{rec}</ul>' if rec else "") + "</a>")
+        print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
+    (out / "index.html").write_text(HUB_INDEX.replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
+                                    .replace("{when}", datetime.now().strftime("%Y-%m-%d %H:%M"))
+                                    .replace("{cards}", "".join(cards)))
+    print(f"hub: {len(roots)} project(s) -> {out}")
+
+
 def cmd_projects(a):
     if not PROJECTS_TSV.is_file():
         print("(no lab-exp projects registered on this machine)")
@@ -2371,6 +2459,11 @@ def main():
     s.add_argument("--sync", action="store_true", help="write cached facts into READMEs that lack them (additive)")
     s.add_argument("--dry-run", action="store_true", help="report only; write nothing")
 
+    s = sub.add_parser("hub", help="static site of EVERY project on this machine: index + DAG per project + its reports")
+    s.add_argument("--out", required=True, help="output directory (rebuilt per project)")
+    s.add_argument("--max-mb", default=25, help="reports above this size become a pointer page (default 25)")
+    s.add_argument("--projects", help="comma-separated project roots (default: every registered project)")
+
     sub.add_parser("index", help="regenerate the package INDEX.md")
     sub.add_parser("doctor", help="drift checks")
     sub.add_parser("projects", help="list lab-exp projects on this machine")
@@ -2383,7 +2476,7 @@ def main():
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
      "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
-     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry,
+     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
 
 

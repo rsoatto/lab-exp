@@ -256,5 +256,32 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("ONE lineage", out)                  # now a second lineage exists but does not use it
 
 
+    # ---- hub: one static site for every project ----------------------------------------------
+
+    def test_hub_builds_index_dag_and_copies_reports(self):
+        self.p.init()
+        a = self.p.new("base")
+        outd = self.p.root / "experiments" / a / "out"
+        (outd / "report.html").write_text("<p>small report</p>")
+        (outd / "viz").mkdir()
+        (outd / "viz" / "big.html").write_text("x" * 2_000_000)
+        self.p.run("done", a, "--finding", "it works: 1 vs 0")
+        site = self.p.tmp / "site"
+        out = self.p.run("hub", "--out", str(site), "--max-mb", "1").stdout
+        self.assertIn("1 experiments, 1 reports, 1 over cap", out)
+        idx = (site / "index.html").read_text()
+        self.assertIn("proj", idx)                      # project card
+        self.assertIn("it works: 1 vs 0", idx)          # recent finding on the card
+        dag = site / "proj" / "index.html"
+        self.assertTrue(dag.is_file() and "<svg" in dag.read_text().lower() or "graph" in dag.read_text().lower())
+        self.assertEqual((site / "proj" / "experiments" / a / "out" / "report.html").read_text(), "<p>small report</p>")
+        big = (site / "proj" / "experiments" / a / "out" / "viz" / "big.html").read_text()
+        self.assertIn("above the hub", big)             # oversized report replaced by a pointer page
+        # the DAG page composes report links as <dir>/out/<report> at runtime; both parts are in its payload
+        txt = dag.read_text()
+        self.assertIn(f"experiments/{a}", txt)
+        self.assertIn("report.html", txt)
+
+
 if __name__ == "__main__":
     unittest.main()

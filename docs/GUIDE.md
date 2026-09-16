@@ -9,7 +9,8 @@ A lab-exp project separates **shared code** (one importable package: methods, mo
 loops, visualizers) from **experiments** (append-only directories, each one reproducible from its
 own README). Each experiment's README front-matter is the record; the registry TSV is a cache
 derived from it (`lab-exp registry --rebuild` regenerates it); wandb is the human live-metrics layer;
-`lab-report` pages compose visualizer renders. `lab-exp` is on PATH everywhere.
+reports live in each experiment's `out/` and reach the phone through the hub (`lab-exp hub`).
+`lab-exp` is on PATH everywhere.
 
 ```
 project/
@@ -62,7 +63,8 @@ project/
    JSON (`--dot` for graphviz) for arbitrary graph searches. For a HUMAN, `lab-exp dag` renders the
    whole DAG as one self-contained interactive HTML page — click a node to read its README, with
    ancestors/descendants highlighted — which is what to produce when the user asks to *see* the
-   lineage. Pipe it straight to a shareable URL: `lab-exp dag --out - | lab-report publish
+   lineage. It is published for the user automatically (the hub, below); to hand one off by
+   hand: `lab-exp dag --out - | lab-report publish
    /dev/stdin --title "<project> — experiment DAG"`. `lab-exp dag --serve` serves it LIVE on
    localhost instead: reloads re-read the registry, and the page gains mark-superseded / undo
    buttons that write it (same locked code path as `lab-exp supersede`) — offer this when the user
@@ -80,8 +82,13 @@ project/
    finding is unfinished. If the experiment warrants human-facing reports (figures, writeups),
    write them as SELF-CONTAINED HTML under `out/` — `out/report.html` for the primary one,
    `out/viz/<name>.html` for additional views. The DAG page surfaces every .html at out/ top level
-   or one subdir deep (▤ marker on the node, links in the panel, primary first). (A published
-   lab-report page can simply also be saved there.) Reproduce an old experiment at its recorded SHA via `git worktree`.
+   or one subdir deep (▤ marker on the node, links in the panel, primary first). **That is where a
+   report goes -- never `lab-report publish` from inside a lab-exp project**: the hub
+   (`lab-exp hub`, published on a schedule as one encrypted site per machine) already puts every
+   project's DAG and every `out/*.html` on the user's phone, so a separately published page is a
+   duplicate that drifts. Build it with the same static-HTML craft (self-contained, Vega-Lite /
+   Plotly / inline SVG, KPI cards, no runtime); tell the user the experiment id, not a URL.
+   Reproduce an old experiment at its recorded SHA via `git worktree`.
 5. **Write the README and reports for a reader who was not there.** The README and the
    recorded finding are read far more often than the code, usually by someone who does not have
    the run in their head (often you, months later). Precise does not mean dense. Plain sentences,
@@ -160,7 +167,7 @@ MATCH = {"arch": "foo"}            # structured-tag constraints ({} = any); valu
 KIND = "training"                  # or None = any kind
 
 def render(exp_dir, out_dir) -> list:   # static: write .vl.json (Vega-Lite, preferred: drops
-    ...                                 # straight into lab-report pages) or .png; return paths
+    ...                                 # straight into out/report.html pages) or .png; return paths
 def serve(exp_dirs, port):              # interactive: host an app on `port` (blocking); takes a
     ...                                 # LIST of experiments — comparison is half the point
 ```
@@ -173,7 +180,8 @@ lab-exp serve act_browser <id> <id2>   # host interactive app in tmux; prints th
 lab-exp serve --list / --stop <port>   # manage; these are ephemeral microscopes, not daemons
 ```
 For a **report**: filter the registry, call the applicable `render()`s, compose the outputs +
-prose with the lab-report skill. Report = durable + phone-reachable; serve = ephemeral + live.
+prose into `experiments/<id>/out/report.html` of the experiment that produced it (the hub publishes
+it). Report = durable + phone-reachable; serve = ephemeral + live.
 marimo is the house convention for serve() apps (a single .py that is both notebook and app).
 
 ## Durable shared computed artifacts: the cache root
