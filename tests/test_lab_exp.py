@@ -283,5 +283,44 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("report.html", txt)
 
 
+    # ---- intents: marks queued on the hub, applied on a box -------------------------------------
+
+    def test_intents_apply_and_exit_codes(self):
+        self.p.init()
+        a = self.p.new("base")
+        b = self.p.new("child", based_on=a)
+        doc = self.p.tmp / "intents.txt"
+        doc.write_text(f"lab-exp intents v1\nproject: proj\nsupersede {a} --by {b} --why \"replaced by child\"\nimportant {b}\n")
+        out = self.p.run("intents", str(doc)).stdout
+        self.assertEqual(out.count("OK "), 2, out)
+        self.assertEqual(front(self.p.readme(a))["superseded_by"], b)
+        self.assertIn("replaced by child", self.p.readme(a).read_text())
+        self.assertIn("important", toks(front(self.p.readme(b))["tags"]))
+        doc.write_text(f"project: proj\nunsupersede {a}\nunimportant {b}\n")
+        self.p.run("intents", str(doc))
+        self.assertNotIn("superseded_by", front(self.p.readme(a)))
+        self.assertNotIn("important", toks(front(self.p.readme(b))["tags"]))
+        # a project that is not on this machine: nothing applied, exit 4 (the other site's publisher owns it)
+        doc.write_text("project: elsewhere\nimportant 20260101-x\n")
+        r = self.p.run("intents", str(doc), check=False)
+        self.assertEqual(r.returncode, 4)
+        self.assertIn("SKIP", r.stdout)
+        # a bad id: reported per line, exit 3, the good line still applied
+        doc.write_text(f"project: proj\nimportant 20260101-nope\nimportant {a}\n")
+        r = self.p.run("intents", str(doc), check=False)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("FAIL important 20260101-nope", r.stdout)
+        self.assertIn("important", toks(front(self.p.readme(a))["tags"]))
+
+    def test_hub_intents_url_reaches_the_page(self):
+        self.p.init()
+        self.p.new("base")
+        site = self.p.tmp / "site"
+        self.p.run("hub", "--out", str(site), "--intents", "https://github.com/x/y/issues/new")
+        self.assertIn('const INTENTS = "https://github.com/x/y/issues/new";', (site / "proj" / "index.html").read_text())
+        self.p.run("hub", "--out", str(site))
+        self.assertIn('const INTENTS = "";', (site / "proj" / "index.html").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

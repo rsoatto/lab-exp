@@ -24,9 +24,12 @@ def main() -> int:
         print("_exp-dag: no experiments in the registry — nothing to draw", file=sys.stderr)
         return 3
     title = html.escape(data.get("project") or "experiments", quote=True)
-    live = "--live" in sys.argv[1:]
+    args = sys.argv[1:]
+    live = "--live" in args
+    intents = args[args.index("--intents") + 1] if "--intents" in args and args.index("--intents") + 1 < len(args) else ""
     sys.stdout.write(
         TEMPLATE.replace("__TITLE__", title).replace("__LIVE__", "true" if live else "false")
+                .replace("__INTENTS__", json.dumps(intents))
                 .replace("__DATA__", json.dumps(data, ensure_ascii=False))
     )
     return 0
@@ -107,6 +110,12 @@ TEMPLATE = r"""<!doctype html>
    border:1px solid var(--line); background:var(--bg); color:inherit; cursor:pointer; }
  .actions button:hover { border-color:var(--mut); }
  #graph.picking { cursor:crosshair; }
+ #intents { position:fixed; left:0; right:0; bottom:0; z-index:5; padding:.55rem 1rem; font-size:.85rem;
+            background:var(--panel); border-top:1px solid var(--line); display:flex; gap:.6rem;
+            align-items:center; flex-wrap:wrap; }
+ #intents button { font:inherit; padding:.25rem .6rem; border:1px solid var(--line); border-radius:6px;
+                   background:transparent; color:inherit; cursor:pointer; }
+ #intents button:first-of-type { border-color:var(--running); color:var(--running); font-weight:600; }
  .node.pick-old rect { stroke-dasharray:5 3; stroke-width:2.5px; }
 </style></head><body>
 <header>
@@ -120,11 +129,19 @@ TEMPLATE = r"""<!doctype html>
   <div id="graph"><svg id="svg"></svg><div id="hint">drag to pan · scroll to zoom · click a node</div></div>
   <aside id="side" class="empty"><div>Select an experiment to read its README.</div></aside>
 </main>
+<div id="intents" hidden><span><b id="intn"></b> queued change(s) — already shown here; the boxes apply them on
+  the next publish (about half an hour).</span>
+  <button id="int-send">Send to GitHub</button><button id="int-copy">Copy commands</button><button id="int-clear">Discard</button></div>
 <script>
 const DATA = __DATA__;
 // LIVE: rendered by `lab-exp dag --serve` — the server that produced this page also accepts
 // POST /supersede and /undo, so the panel grows write buttons. A static render stays read-only.
 const LIVE = __LIVE__;
+// INTENTS: a static page (the hub on GitHub Pages) cannot write, but it can QUEUE marks in the
+// browser and hand them to the lab boxes as one GitHub issue the user submits (logged in on the
+// phone); the hub publisher applies them with lab-exp on its next run. "" = read-only page.
+const INTENTS = __INTENTS__;
+const CAN_MARK = LIVE || !!INTENTS;
 const NODES = DATA.nodes, EDGES = DATA.edges;
 const byId = new Map(NODES.map(n => [n.id, n]));
 const COLORS = { planned:"--planned", running:"--running", ran:"--ran", done:"--ran", superseded:"--superseded",
@@ -215,6 +232,68 @@ const tagsOf = n => (n.tags || "").split(",").map(t => t.trim()).filter(Boolean)
 const isImp = id => tagsOf(byId.get(id)).includes("important");
 const impCount = () => ALL_IDS.filter(isImp).length;
 let showSup = false, impOnly = false;
+
+/* ---- queued marks (static pages with INTENTS) ------------------------------------------- */
+// The view applies a mark immediately; the boxes apply it later. Reconciled on every load: a mark
+// the published data already carries is dropped from the queue.
+const IKEY = "labexp-intents:" + (DATA.project || "");
+const OPP = { supersede: "unsupersede", unsupersede: "supersede", important: "unimportant", unimportant: "important" };
+let PENDING = [];
+try { PENDING = JSON.parse(localStorage.getItem(IKEY) || "[]"); } catch (e) { PENDING = []; }
+const snapshot = (n, op) => op === "important" || op === "unimportant"
+  ? { tags: n.tags || "" } : { status: n.status, superseded_by: n.superseded_by || "" };
+function applyIntent(it) {
+  const n = byId.get(it.id); if (!n) return;
+  if (it.op === "supersede")   { n.status = "superseded"; n.superseded_by = it.by || ""; SUP.add(it.id); }
+  if (it.op === "unsupersede") { n.status = "done"; n.superseded_by = ""; SUP.delete(it.id); }
+  if (it.op === "important" || it.op === "unimportant") {
+    const t = tagsOf(n).filter(x => x !== "important"); if (it.op === "important") t.push("important");
+    n.tags = t.join(",");
+  }
+}
+function revertIntent(it) {
+  const n = byId.get(it.id); if (!n || !it.prev) return;
+  Object.assign(n, it.prev);
+  if (n.status === "superseded") SUP.add(it.id); else SUP.delete(it.id);
+}
+function reflected(it) {
+  const n = byId.get(it.id); if (!n) return true;
+  if (it.op === "supersede")   return n.status === "superseded" && (n.superseded_by || "").trim() === (it.by || "");
+  if (it.op === "unsupersede") return n.status !== "superseded";
+  if (it.op === "important")   return isImp(it.id);
+  if (it.op === "unimportant") return !isImp(it.id);
+  return true;
+}
+PENDING = PENDING.filter(it => !reflected(it));
+PENDING.forEach(it => { it.prev = snapshot(byId.get(it.id), it.op); applyIntent(it); });
+function savePending() { try { localStorage.setItem(IKEY, JSON.stringify(PENDING)); } catch (e) {} refreshIntents(); }
+function queueIntent(op, id, extra) {
+  const n = byId.get(id);
+  const same = PENDING.filter(p => p.id === id && (p.op === op || p.op === OPP[op]));
+  same.forEach(revertIntent);                              // at most one queued mark per family per node
+  PENDING = PENDING.filter(p => !same.includes(p));
+  if (!same.some(p => p.op === OPP[op])) {                 // the opposite of a queued mark just drops it
+    const it = { op, id, ...(extra || {}), prev: snapshot(n, op), t: Date.now() };
+    applyIntent(it); PENDING.push(it);
+  }
+  savePending();
+}
+const shq = s => '"' + String(s).replace(/[\r\n]+/g, " ").replace(/["\\]/g, "'") + '"';
+const intentLines = () => PENDING.map(it => it.op === "supersede"
+  ? `supersede ${it.id}` + (it.by ? ` --by ${it.by}` : "") + (it.why ? ` --why ${shq(it.why)}` : "")
+  : `${it.op} ${it.id}`);
+function refreshIntents() {
+  const bar = document.getElementById("intents"); if (!bar) return;
+  bar.hidden = !PENDING.length;
+  const sent = PENDING.filter(it => it.sent).length;
+  document.getElementById("intn").textContent = PENDING.length + (sent ? ` (${sent} sent)` : "");
+  document.getElementById("int-send").textContent = sent && sent === PENDING.length ? "Send again" : "Send to GitHub";
+}
+function afterMark(id) {
+  refreshSup(); refreshImp(); draw();
+  document.getElementById("count").textContent = countText();
+  select(id);
+}
 // THE visibility predicate -- the only definition. Search and drawing both use it; a new filter
 // gets added here once.
 const visible = id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id));
@@ -418,8 +497,9 @@ function applyLocal(id, status, by) {
 async function doSupersede(oldId, byId_) {
   const why = window.prompt("Why is it superseded? (optional — goes in the README)", "");
   if (why === null) { setPicking(null); return; }        // Cancel aborts
-  const res = await api("/supersede", { old: oldId, by: byId_, why });
   setPicking(null);
+  if (!LIVE) { queueIntent("supersede", oldId, { by: byId_, why }); afterMark(oldId); return; }
+  const res = await api("/supersede", { old: oldId, by: byId_, why });
   if (res) applyLocal(oldId, "superseded", res.by || "");
 }
 function nodeClick(id) {
@@ -447,7 +527,7 @@ function select(id) {
   side.innerHTML = `
     <h2>${esc(id.replace(/^\d{8}-/, ""))}</h2>
     <div class="meta">${esc(id)}</div>
-    ${LIVE ? `<div class="actions">${picking && picking.old === id
+    ${CAN_MARK ? `<div class="actions">${picking && picking.old === id
         ? `<button id="btn-nosucc">supersede with NO successor</button><button id="btn-cancel">cancel</button>`
         : n.status === "superseded"
           ? `<button id="btn-undo">undo supersede</button>`
@@ -466,8 +546,12 @@ function select(id) {
   on("btn-sup",    () => { setPicking({ old: id }); select(id); });
   on("btn-cancel", () => { setPicking(null); select(id); });
   on("btn-nosucc", () => doSupersede(id, ""));
-  on("btn-undo",   async () => { if (await api("/undo", { id })) applyLocal(id, "done", ""); });
+  on("btn-undo",   async () => {
+    if (!LIVE) { queueIntent("unsupersede", id); afterMark(id); return; }
+    if (await api("/undo", { id })) applyLocal(id, "done", "");
+  });
   on("btn-imp",    async () => {
+    if (!LIVE) { queueIntent(isImp(id) ? "unimportant" : "important", id); afterMark(id); return; }
     const res = await api("/important", { id, on: !isImp(id) });
     if (!res) return;
     byId.get(id).tags = res.tags;      // server returns the canonical string -- no client surgery
@@ -578,7 +662,7 @@ function refreshSup() {
 function refreshImp() {
   const n = impCount();
   const lab = document.getElementById("implabel");
-  lab.style.display = (n || LIVE) ? "" : "none";   // live pages show it once marking is possible
+  lab.style.display = (n || CAN_MARK) ? "" : "none";   // show it wherever marking is possible
   document.getElementById("impn").textContent = n;
 }
 refreshSup();
@@ -591,6 +675,25 @@ if (SUP.size) {
   });
 }
 refreshImp();
+refreshIntents();
+if (INTENTS) {
+  document.getElementById("int-send").addEventListener("click", () => {
+    if (!PENDING.length) return;
+    const body = ["lab-exp intents v1", "project: " + (DATA.project || ""), ...intentLines()].join("\n");
+    const title = `[lab-exp] ${DATA.project || "project"}: ${PENDING.length} change(s)`;
+    PENDING.forEach(it => { it.sent = Date.now(); }); savePending();
+    window.open(INTENTS + "?title=" + encodeURIComponent(title) + "&body=" + encodeURIComponent(body), "_blank");
+  });
+  document.getElementById("int-copy").addEventListener("click", async () => {
+    const text = intentLines().map(l => "lab-exp " + l).join("\n");
+    try { await navigator.clipboard.writeText(text); } catch (e) { window.prompt("copy these:", text); }
+  });
+  document.getElementById("int-clear").addEventListener("click", () => {
+    PENDING.slice().reverse().forEach(revertIntent); PENDING = []; savePending();
+    refreshSup(); refreshImp(); draw(); document.getElementById("count").textContent = countText();
+    if (selected) select(selected);
+  });
+}
 document.getElementById("imponly").addEventListener("change", ev => {
   impOnly = ev.target.checked;
   if (selected && impOnly && !isImp(selected)) selected = null;

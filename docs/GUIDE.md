@@ -86,7 +86,9 @@ project/
    report goes -- never `lab-report publish` from inside a lab-exp project**: the hub
    (`lab-exp hub`, published on a schedule as one encrypted site per machine) already puts every
    project's DAG and every `out/*.html` on the user's phone, so a separately published page is a
-   duplicate that drifts. Build it with the same static-HTML craft (self-contained, Vega-Lite /
+   duplicate that drifts. The hub's DAG pages also carry the supersede / important buttons: a mark made
+   there is queued in the browser and submitted as a GitHub issue, which the publisher applies
+   with `lab-exp intents` on its next run. Build it with the same static-HTML craft (self-contained, Vega-Lite /
    Plotly / inline SVG, KPI cards, no runtime); tell the user the experiment id, not a URL.
    Reproduce an old experiment at its recorded SHA via `git worktree`.
 5. **Write the README and reports for a reader who was not there.** The README and the

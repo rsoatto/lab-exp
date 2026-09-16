@@ -1411,7 +1411,7 @@ def cmd_dag(a):
     print("  publish it:   lab-exp dag --out - | lab-report publish /dev/stdin --title '<project> — experiment DAG'")
 
 
-def dag_html(root, live=False):
+def dag_html(root, live=False, intents=""):
     rows, parents, _children = graph_maps(root)
     nodes = []
     for eid, r in rows.items():
@@ -1452,6 +1452,7 @@ def dag_html(root, live=False):
     title = _html.escape(payload["project"] or "experiments", quote=True)
     return (mod.TEMPLATE.replace("__TITLE__", title)
             .replace("__LIVE__", "true" if live else "false")
+            .replace("__INTENTS__", json.dumps(intents or ""))
             .replace("__DATA__", json.dumps(payload, ensure_ascii=False)))
 
 
@@ -1782,6 +1783,80 @@ a.card:hover{border-color:#888}.name{font-weight:600;font-size:16px}.meta{color:
 <div class="grid">{cards}</div>"""
 
 
+def project_roots():
+    """Registered lab-exp project roots on this machine that still carry a config."""
+    roots = []
+    if PROJECTS_TSV.is_file():
+        for line in PROJECTS_TSV.read_text().splitlines():
+            parts = line.split("\t")
+            if len(parts) > 1 and (Path(parts[1]) / CONFIG_NAME).is_file():
+                roots.append(Path(parts[1]).resolve())
+    return sorted(set(roots))
+
+
+def apply_intents(text, dry_run=False):
+    """Apply a 'lab-exp intents v1' document -- what the hub page composes into a GitHub issue when
+    the user marks experiments from the phone. Lines: `project: NAME`, then
+    `supersede ID [--by ID] [--why "..."]`, `unsupersede ID`, `important ID`, `unimportant ID`.
+    Returns (results, applicable): results = [(OK|FAIL|SKIP|DRY, line, detail)]; applicable is
+    False when no line targets a project on this machine (another site's publisher owns it)."""
+    roots = {}
+    for r in project_roots():
+        roots[load_cfg(r)["project"].get("name") or r.name] = r
+        roots.setdefault(r.name, r)
+    project, results, applicable = "", [], False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.lower().startswith("lab-exp intents"):
+            continue
+        if line.startswith("project:"):
+            project = line.split(":", 1)[1].strip()
+            continue
+        root = roots.get(project)
+        if root is None:
+            results.append(("SKIP", line, f"project '{project}' is not on this machine"))
+            continue
+        applicable = True
+        try:
+            toks = shlex.split(line)
+            op, args = toks[0], toks[1:]
+            if op not in ("supersede", "unsupersede", "important", "unimportant"):
+                raise ValueError(f"unknown op '{op}'")
+            if dry_run:
+                results.append(("DRY", line, str(root)))
+                continue
+            if op == "supersede":
+                sp = argparse.ArgumentParser(prog="supersede", add_help=False)
+                sp.add_argument("id"); sp.add_argument("--by", default=""); sp.add_argument("--why", default="")
+                o = sp.parse_args(args)
+                succ = do_supersede(root, o.id, o.by, o.why)
+                results.append(("OK", line, f"{exp_dir(root, o.id).name} superseded" + (f" by {succ}" if succ else "")))
+            elif op == "unsupersede":
+                do_unsupersede(root, args[0])
+                results.append(("OK", line, f"{exp_dir(root, args[0]).name} restored to done"))
+            else:
+                do_set_important(root, args[0], op == "important")
+                results.append(("OK", line, f"{exp_dir(root, args[0]).name} {'marked' if op == 'important' else 'unmarked'} important"))
+        except SystemExit:            # exp_dir die()s on an unknown id; argparse on bad args
+            results.append(("FAIL", line, "unknown experiment id or bad arguments"))
+        except (IndexError, ValueError) as e:
+            results.append(("FAIL", line, str(e)))
+    return results, applicable
+
+
+def cmd_intents(a):
+    """Apply queued marks from the hub (a GitHub issue body). Exit 0: applied; 3: some line
+    failed; 4: nothing here targets a project on this machine (leave it for the other site)."""
+    text = sys.stdin.read() if a.file == "-" else Path(a.file).read_text()
+    results, applicable = apply_intents(text, dry_run=a.dry_run)
+    for v, line, detail in results:
+        print(f"{v} {line}" + (f"  -- {detail}" if detail else ""))
+    if not applicable:
+        print("nothing applicable on this machine")
+        sys.exit(4)
+    sys.exit(3 if any(v == "FAIL" for v, _l, _d in results) else 0)
+
+
 def cmd_hub(a):
     """A STATIC multi-project site: an index of every lab-exp project registered on this machine,
     one DAG page per project, and every experiment report (out/*.html, one subdir deep) copied
@@ -1792,15 +1867,7 @@ def cmd_hub(a):
     """
     out = Path(a.out).resolve()
     cap = float(a.max_mb) * 1024 * 1024
-    roots = []
-    if a.projects:
-        roots = [Path(r).resolve() for r in split_list(a.projects)]
-    elif PROJECTS_TSV.is_file():
-        for line in PROJECTS_TSV.read_text().splitlines():
-            parts = line.split("\t")
-            if len(parts) > 1 and (Path(parts[1]) / CONFIG_NAME).is_file():
-                roots.append(Path(parts[1]).resolve())
-    roots = sorted(set(roots))
+    roots = sorted({Path(r).resolve() for r in split_list(a.projects)}) if a.projects else project_roots()
     if not roots:
         die("no lab-exp projects found (none registered in " + str(PROJECTS_TSV) + ", or pass --projects)")
     out.mkdir(parents=True, exist_ok=True)
@@ -1813,7 +1880,7 @@ def cmd_hub(a):
         if pdir.exists():
             shutil.rmtree(pdir)
         pdir.mkdir(parents=True)
-        (pdir / "index.html").write_text(dag_html(root))
+        (pdir / "index.html").write_text(dag_html(root, intents=a.intents))
         rows = reg_read(root)
         n_rep, n_big = 0, 0
         for r in rows:
@@ -2463,6 +2530,13 @@ def main():
     s.add_argument("--out", required=True, help="output directory (rebuilt per project)")
     s.add_argument("--max-mb", default=25, help="reports above this size become a pointer page (default 25)")
     s.add_argument("--projects", help="comma-separated project roots (default: every registered project)")
+    s.add_argument("--intents", default="", metavar="URL",
+                   help="a GitHub 'new issue' URL: the DAG pages then let the user queue supersede/important "
+                        "marks and submit them as an issue, which `lab-exp intents` applies (via the publisher)")
+
+    s = sub.add_parser("intents", help="apply queued hub marks (a 'lab-exp intents v1' document, e.g. an issue body)")
+    s.add_argument("file", help="path, or - for stdin")
+    s.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("index", help="regenerate the package INDEX.md")
     sub.add_parser("doctor", help="drift checks")
@@ -2476,7 +2550,7 @@ def main():
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
      "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
-     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub,
+     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
 
 
