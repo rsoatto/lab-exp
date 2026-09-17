@@ -278,7 +278,13 @@ def reg_sync(root, dry_run=False):
         fm = read_front(readme)
         if not fm:
             continue
-        upd = {k: r[k] for k in FRONT_KEYS if r.get(k, "") and not fm.get(k, "")}
+        # Only facts the README cannot reproduce by itself. A cached row that a rebuild DERIVED
+        # (status inferred from the Result section, date from the id, metrics from
+        # out/metrics.json) must not be written back as if lab-exp had recorded it -- that put
+        # `status: unknown` into a collaborator's hand-made README (scout-translation, 2026-09-16).
+        derived = row_from_readme(readme.parent) or {}
+        upd = {k: r[k] for k in FRONT_KEYS
+               if r.get(k, "") and not fm.get(k, "") and r[k] != derived.get(k, "")}
         have, want = split_list(fm.get("tags", "")), split_list(r.get("tags", ""))
         extra = [t for t in want if t not in have]
         if extra:

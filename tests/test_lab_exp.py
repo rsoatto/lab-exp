@@ -200,6 +200,27 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("20260908-hand-made", read_tsv(self.p.tsv))
         self.assertNotIn("not in the registry cache", self.p.run("doctor", check=False).stdout)
 
+    def test_sync_never_touches_a_hand_made_readme(self):
+        """A rebuild caches DERIVED facts for a collaborator's experiment; the next sync must not
+        write them back into the README as if lab-exp had recorded them."""
+        self.p.init()
+        self.p.new("mine")
+        d = self._foreign("20260908-hand-made", metrics={"acc": 0.7})
+        before = (d / "README.md").read_bytes()
+        self.p.run("registry", "--rebuild")
+        self.p.run("registry", "--rebuild")          # second pass syncs from the now-populated cache
+        self.p.run("registry", "--sync")
+        self.assertEqual((d / "README.md").read_bytes(), before)
+        # while a fact lab-exp DID record still reaches a README that lacks it
+        eid = self.p.new("recorded")
+        self.p.run("done", eid, "--status", "failed", "--finding", "broke")
+        rm = self.p.readme(eid)
+        rm.write_text("\n".join(l for l in rm.read_text().splitlines() if not l.startswith(("status:", "finding:"))) + "\n")
+        self.p.run("registry", "--sync")
+        fm = front(rm)
+        self.assertEqual(fm["status"], "failed")
+        self.assertEqual(fm["finding"], "broke")
+
     def test_missing_frontmatter_is_still_a_warning(self):
         self.p.init()
         d = self.p.root / "experiments" / "20260101-bare"
