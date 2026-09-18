@@ -279,6 +279,16 @@ class LabExpTests(unittest.TestCase):
 
     # ---- hub: one static site for every project ----------------------------------------------
 
+    def test_dag_page_reads_deep_link_params(self):
+        # ?days=7 / ?q=<id> links from the notes and the weekly digest rely on this block
+        self.p.init()
+        self.p.new("base")
+        site = self.p.tmp / "site_dl"
+        self.p.run("hub", "--out", str(site))
+        txt = (site / "proj" / "index.html").read_text()
+        for needle in ('P.get("days")', 'P.get("q")', 'P.get("from")', 'P.get("important")'):
+            self.assertIn(needle, txt)
+
     def test_hub_builds_index_dag_and_copies_reports(self):
         self.p.init()
         a = self.p.new("base")

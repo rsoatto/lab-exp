@@ -744,6 +744,29 @@ for (const id of ["datefrom", "dateto"])
     setDates(document.getElementById("datefrom").value, document.getElementById("dateto").value));
 document.getElementById("count").textContent = countText();
 draw();
+/* ---- deep links: ?days=7 | ?from=YYYY-MM-DD&to=YYYY-MM-DD | ?q=<text> | ?important=1 ----------
+   So a note or a digest can link straight to "this week's experiments" or to one experiment.
+   Works behind the hub's lock page too: decryption rewrites the document, not the URL. */
+(() => {
+  const P = new URLSearchParams(location.search || location.hash.replace(/^#/, "?"));
+  const days = Number(P.get("days") || 0);
+  if (days > 0) {
+    const from = new Date(); from.setDate(from.getDate() - days + 1);
+    const sel = document.getElementById("datepre");
+    if ([...sel.options].some(o => o.value === String(days))) sel.value = String(days);
+    else { sel.value = "custom"; document.getElementById("daterange").style.display = ""; }
+    setDates(isoDay(from), "");
+  } else if (P.get("from") || P.get("to")) {
+    const sel = document.getElementById("datepre");
+    sel.value = "custom"; document.getElementById("daterange").style.display = "";
+    setDates(P.get("from") || "", P.get("to") || "");
+  }
+  if (P.get("important") === "1") {
+    const cb = document.getElementById("imponly");
+    if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event("change")); }
+  }
+  if (P.get("q")) { q.value = P.get("q"); q.dispatchEvent(new Event("input")); }
+})();
 </script>
 </body></html>
 """
