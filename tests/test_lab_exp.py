@@ -396,8 +396,8 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("fetch/iframe", d)
         self.assertIn("no viewport meta", d)
         (self.p.root / "experiments" / a / "out" / "big.html").write_bytes(b"x" * (26 * 1048576))
-        d = self.p.run("doctor", check=False).stdout
-        self.assertIn("26 MB > 25 MB hub cap", d)
+        r = self.p.run("doctor", check=False)
+        self.assertIn("note", r.stdout.split("26 MB > 25 MB hub cap")[0].splitlines()[-1])   # a note, not an issue
 
 
 if __name__ == "__main__":

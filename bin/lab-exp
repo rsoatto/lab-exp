@@ -2082,9 +2082,9 @@ def report_issues(path):
     except OSError:
         return out
     if size > REPORT_CAP_MB * 1048576:
-        out.append(f"{size / 1048576:.0f} MB > {REPORT_CAP_MB} MB hub cap (shows as a pointer page)")
+        out.append(f"note: {size / 1048576:.0f} MB > {REPORT_CAP_MB} MB hub cap -- the hub shows a pointer page instead")
     if size > 4 * 1048576:
-        return out             # too big to scan cheaply; the size warning already covers it
+        return out             # too big to scan cheaply; the size note already covers it
     try:
         txt = path.read_text(errors="replace")
     except OSError:
@@ -2100,10 +2100,12 @@ def report_issues(path):
         out.append("loads data at open time (fetch/iframe) -- embed it in the page instead")
     if "data-todo" in txt:
         out.append("skeleton placeholders (data-todo) still present -- unfinished report")
+    # Phone-readability nits are notes, not issues: 33 legacy reports lacked a viewport meta when
+    # this check arrived, and fixing old reports is not worth touching finished experiments.
     if "<title>" not in low:
-        out.append("no <title>")
+        out.append("note: no <title>")
     if 'name="viewport"' not in txt:
-        out.append("no viewport meta (unreadable on a phone)")
+        out.append("note: no viewport meta (renders zoomed-out on a phone)")
     return out
 
 
@@ -2602,7 +2604,12 @@ def cmd_doctor(a):
     for w in pkg_health(root, cfg):
         flag(w)
     for eid, rel, issue in report_health(root):
-        flag(f"{eid}: report {rel}: {issue}")
+        # Over-cap is informational (the hub copes with a pointer page; shrinking an old report is
+        # not worth an append-only experiment's history). The structural ones break the page.
+        if issue.startswith("note: "):
+            print(f"  note {eid}: report {rel}: {issue[6:]}")
+        else:
+            flag(f"{eid}: report {rel}: {issue}")
     dead = [r for r in serves_read() if not tmux_alive(r[3])]
     for r in dead:
         print(f"  note dead serve entry pruned: {r[1]} port {r[2]}")
