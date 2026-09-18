@@ -75,6 +75,14 @@ TEMPLATE = r"""<!doctype html>
  aside { width:min(30rem,42vw); border-left:1px solid var(--line); background:var(--panel);
          overflow:auto; padding:1.1rem 1.3rem; }
  aside.empty { display:grid; place-items:center; color:var(--mut); text-align:center; }
+ @media (max-width: 640px) {
+   header { padding:.5rem .8rem; gap:.35rem .7rem; }
+   #legend { display:none; }               /* the status colours are on the nodes themselves */
+   main { flex-direction:column; }
+   #graph { min-height:0; flex:1; }
+   aside { width:auto; max-height:40vh; border-left:0; border-top:1px solid var(--line); padding:.9rem 1rem; }
+   aside.empty { max-height:none; flex:0 0 auto; padding:.5rem; font-size:.85rem; }
+ }
  aside h2 { font-size:1.05rem; margin:.1rem 0 .15rem; }
  .meta { color:var(--mut); font-size:.83rem; margin-bottom:.5rem; }
  .chips { display:flex; gap:.35rem; flex-wrap:wrap; margin:.5rem 0 1rem; }
@@ -97,30 +105,42 @@ TEMPLATE = r"""<!doctype html>
  .md pre code { background:none; padding:0; }
  .md hr { border:0; border-top:1px solid var(--line); margin:1rem 0; }
  svg text { user-select:none; }
- .node rect { stroke-width:1.5px; }
- .node.dim { opacity:.16; }
- .edge.dim { opacity:.06; }
- .edge.hot { stroke-width:2.2px; }
- /* search HIT: emphasize the match rather than removing everything else, so a result keeps the
-    lineage around it visible. Needs its own accent because .dim alone reads as "slightly faded
-    page" once several nodes match. */
- .node.hit rect { stroke-width:3px; }
- .node.hit { filter: drop-shadow(0 0 7px color-mix(in srgb, var(--fg) 40%, transparent)); }
- .node.miss { opacity:.13; }
- .edge.miss { opacity:.05; }
- .edge.inherit { stroke-dasharray:4 3; }
+ /* Every node is always drawn. --status is set inline per node; --c is what the shapes use, so a
+    class can recolor a node without fighting the inline style. */
+ .node { cursor:pointer; --c: var(--status); transition: opacity .35s ease; }
+ .node rect.box { fill:var(--panel); stroke:var(--c); stroke-width:1.5px; transition: stroke .3s; }
+ .node rect.acc { fill:var(--c); transition: fill .3s; }
+ .node text.t1 { font-size:13px; font-weight:600; fill:var(--fg); transition: fill .3s; }
+ .node text.t2 { font-size:11px; fill:var(--mut); }
+ .node text.rep { font-size:10px; fill:var(--running); }
+ /* OUT = fails a filter (superseded, important-only, date, search): greyed and laid out in the band
+    ABOVE the focused nodes, but still drawn, so a focused node's lineage can be traced into it. */
+ .node.out { opacity:.45; --c: var(--mut); }
+ .node.out text.t1 { fill:var(--mut); }
+ .edge { stroke:var(--line); stroke-width:1.4px; fill:none; transition: opacity .35s ease, stroke .2s; }
+ .edge.out { opacity:.32; }
+ /* selection lens: direct neighbours stay, everything else fades further */
+ .node.dim { opacity:.12; }
+ .edge.dim { opacity:.05; }
+ .edge.hot { stroke:var(--hot, var(--fg)); stroke-width:2.2px; opacity:1; }
+ #arrow path { fill:var(--line); }
+ #arrow-hot path { fill:var(--hot, var(--fg)); }
+ .band-line { stroke:var(--line); stroke-dasharray:7 6; stroke-width:1.2px; }
+ .band-label { font-size:11px; fill:var(--mut); letter-spacing:.02em; }
+ .bands { transition: opacity .35s ease; }
  .actions { display:flex; gap:.5rem; margin:.2rem 0 .9rem; }
  .actions button { font:inherit; font-size:.8rem; padding:.3rem .7rem; border-radius:7px;
    border:1px solid var(--line); background:var(--bg); color:inherit; cursor:pointer; }
  .actions button:hover { border-color:var(--mut); }
  #graph.picking { cursor:crosshair; }
+ #intents[hidden] { display:none; }   /* the flex rule below would otherwise beat the hidden attribute */
  #intents { position:fixed; left:0; right:0; bottom:0; z-index:5; padding:.55rem 1rem; font-size:.85rem;
             background:var(--panel); border-top:1px solid var(--line); display:flex; gap:.6rem;
             align-items:center; flex-wrap:wrap; }
  #intents button { font:inherit; padding:.25rem .6rem; border:1px solid var(--line); border-radius:6px;
                    background:transparent; color:inherit; cursor:pointer; }
  #intents button:first-of-type { border-color:var(--running); color:var(--running); font-weight:600; }
- .node.pick-old rect { stroke-dasharray:5 3; stroke-width:2.5px; }
+ .node.pick-old rect.box { stroke-dasharray:5 3; stroke-width:2.5px; }
 </style></head><body>
 <header>
   <h1>__TITLE__</h1><span class="count" id="count"></span>
@@ -130,7 +150,7 @@ TEMPLATE = r"""<!doctype html>
       <option value="90">last 90 days</option><option value="custom">custom range…</option></select>
     <span id="daterange" style="display:none"><input type="date" id="datefrom"> – <input type="date" id="dateto"></span></span>
   <label class="legend" id="implabel" style="display:none;cursor:pointer"><input type="checkbox" id="imponly"> ★ important only (<span id="impn"></span>)</label>
-  <label class="legend" id="suplabel" style="display:none;cursor:pointer"><input type="checkbox" id="showsup"> show superseded (<span id="supn"></span>)</label>
+  <label class="legend" id="suplabel" style="display:none;cursor:pointer"><input type="checkbox" id="showsup"> include superseded (<span id="supn"></span>)</label>
   <span class="legend" id="legend"></span>
 </header>
 <main>
@@ -221,18 +241,21 @@ function layout(ids, parentMap) {
   return { pos, width: full, height: Math.max(H, y - GAPY) };
 }
 
-/* ---- render ---------------------------------------------------------------------------- */
+/* ---- render state ---------------------------------------------------------------------- */
 const svg = document.getElementById("svg");
 const NS = "http://www.w3.org/2000/svg";
-// The graph is laid out ONCE over every node and never re-laid-out. Search highlights in place:
-// removing non-matches would reflow the DAG on each keystroke, so a node moved out from under the
-// cursor and the lineage that gives a match its meaning vanished with it. `matched` is null when
-// the box is empty, which means "no search lens active" (distinct from "nothing matched").
+// EVERY node is always drawn. The filters (superseded, important-only, date, search) split the
+// graph into a FOCUSED band and an OUT band: out nodes are greyed and laid out ABOVE the focused
+// ones, and every edge stays drawn, so a focused node's lineage can be traced into the greyed band
+// instead of vanishing (hiding them orphaned lineages; greying them in place buried the few you
+// wanted among hundreds). A filter change lays both bands out again and ANIMATES nodes, edges and
+// the camera to their new places; nothing is rebuilt, so the node under the cursor stays the same
+// element. `matched` is null when the search box is empty (no search lens), else the match set.
 let view = { x: 0, y: 0, k: 1 }, selected = null, matched = null;
 const ALL_IDS = NODES.map(n => n.id);
-// Superseded experiments are HIDDEN by default -- they were valid once and stay in the registry
-// (append-only), but they answer "what did I do", not "what is true now". The checkbox restores
-// them; navigating to one from a visible node's parent/child list restores them automatically.
+// Superseded experiments are OUT by default -- they were valid once and stay in the registry
+// (append-only), but they answer "what did I do", not "what is true now". The checkbox brings
+// them into the focused band.
 const SUP = new Set(NODES.filter(n => n.status === "superseded").map(n => n.id));
 // 'important' is a plain token in the ordinary tags field -- the DAG just gives it a filter and
 // (when live) a toggle; lab-exp important <id> is the CLI spelling.
@@ -306,14 +329,15 @@ function refreshIntents() {
   document.getElementById("int-send").textContent = sent && sent === PENDING.length ? "Send again" : "Send to GitHub";
 }
 function afterMark(id) {
-  refreshSup(); refreshImp(); draw();
-  document.getElementById("count").textContent = countText();
+  refreshSup(); refreshImp(); refreshNodeStyles(); refilter({ force: true });
   select(id);
 }
-// THE visibility predicate -- the only definition. Search and drawing both use it; a new filter
-// gets added here once.
-const visible = id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id)) && inDate(id);
-const shownIds = () => ALL_IDS.filter(visible);
+// THE focus predicate -- the only definition. Every filter, search included, lives here; a new
+// filter gets added here once.
+const passes = id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id)) && inDate(id)
+                     && (!matched || matched.has(id));
+const visible = passes;                          // older name, kept for callers
+const shownIds = () => ALL_IDS.filter(passes);
 
 function el(t, a = {}, kids = []) {
   const n = document.createElementNS(NS, t);
@@ -323,166 +347,210 @@ function el(t, a = {}, kids = []) {
 }
 const esc = s => String(s ?? "");
 
-let POS = null;   // node id -> {x,y,w,h}; kept from the single layout so search can frame matches
+let POS = new Map();   // node id -> {x,y,w,h}: CURRENT positions (mid-animation included)
+let FOCUS = null;      // the focused id set as of the last relayout
+const W = 210, H = 62; // node box; layout() owns the gaps
 
-/* When superseded nodes are HIDDEN, their successor stands in for them structurally: every edge
-   touching a hidden superseded node reroutes to its ultimate visible successor (superseded_by
-   chains followed recursively), drawn dashed. Without this, hiding a node orphans its successor
-   and the lineage the DAG exists to show evaporates. Chains that dead-end (no successor) drop
-   their edges, as before. Scoped to superseded-hiding only -- the important-only filter is a lens,
-   not a replacement relation, so it does not reroute. */
-function repOf(id) {
-  let cur = id;
-  for (let i = 0; i < 50 && !showSup && SUP.has(cur); i++) {
-    const nxt = ((byId.get(cur) || {}).superseded_by || "").trim();
-    if (!nxt || !byId.has(nxt)) return null;      // hidden with no successor: edges drop
-    cur = nxt;
-  }
-  return (!showSup && SUP.has(cur)) ? null : cur; // cycle guard tripped: treat as dead end
-}
-let EFF = { parents, children };                  // effective adjacency of the CURRENT drawing
-const ANC = new Map();                            // real-DAG ancestor sets, memoized
-function ancestorsOf(id) {
-  if (ANC.has(id)) return ANC.get(id);
-  const seen = new Set(), stack = [...(parents.get(id) || [])];
-  while (stack.length) { const a = stack.pop(); if (seen.has(a)) continue; seen.add(a); stack.push(...(parents.get(a) || [])); }
-  ANC.set(id, seen);
-  return seen;
-}
-function effectiveEdges(SH) {
-  const seen = new Map();                         // "p->c" -> {parent, child, synthetic}
+/* ---- persistent DOM: built once, restyled and moved afterwards -------------------------- */
+const gBands = el("g", { class: "bands" }), gEdges = el("g"), gNodes = el("g");
+const NODE_EL = new Map(), EDGE_EL = [];
+function buildDom() {
+  const defs = el("defs");
+  for (const mid of ["arrow", "arrow-hot"])
+    defs.appendChild(el("marker", { id: mid, viewBox: "0 0 10 10", refX: 9, refY: 5,
+      markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" },
+      [el("path", { d: "M0,0 L10,5 L0,10 z" })]));
   for (const e of EDGES) {
-    const P = repOf(e.parent), C = repOf(e.child);
-    if (!P || !C || P === C || !SH.has(P) || !SH.has(C)) continue;
-    // Cycle guard: a hidden node H with child G and successor S, where S was itself built on
-    // G (H -> G -> S, then H superseded by S), reroutes H->G into S->G and closes a loop. Such an
-    // edge is redundant (G already leads to S) -- drop it rather than hand layout a cycle, which
-    // it survives only by producing holes that crashed the whole page (FUS registry, 2026-09-02).
-    if (ancestorsOf(P).has(C)) continue;
-    const k = P + "\u0000" + C, syn = P !== e.parent || C !== e.child;
-    if (!seen.has(k) || !syn) seen.set(k, { parent: P, child: C, synthetic: seen.has(k) ? (seen.get(k).synthetic && syn) : syn });
+    if (!byId.has(e.child) || !byId.has(e.parent) || e.child === e.parent) continue;   // dangling edge: registry pruned it
+    const p = el("path", { class: "edge", "data-c": e.child, "data-p": e.parent, "marker-end": "url(#arrow)" });
+    EDGE_EL.push({ el: p, parent: e.parent, child: e.child });
+    gEdges.appendChild(p);
   }
-  return [...seen.values()];
-}
-
-function draw() {
-  const ids = shownIds(), SH = new Set(ids);
-  const eff = effectiveEdges(SH);
-  const ep = new Map(ids.map(i => [i, []])), ec = new Map(ids.map(i => [i, []]));
-  for (const e of eff) { ep.get(e.child).push(e.parent); ec.get(e.parent).push(e.child); }
-  EFF = { parents: ep, children: ec };
-  const { pos, width, height } = layout(ids, ep);
-  if (!ids.length) hint.textContent = "no experiments match the current filters";
-  else if (!picking) hint.textContent = "drag to pan · scroll to zoom · click a node";
-  POS = pos;
-  svg.replaceChildren();
-  const gEdges = el("g"), gNodes = el("g");
-
-  for (const e of eff) {
-    const a = pos.get(e.parent), b = pos.get(e.child);
-    const x1 = a.x + a.w / 2, y1 = a.y + a.h, x2 = b.x + b.w / 2, y2 = b.y;
-    const m = (y1 + y2) / 2;
-    gEdges.appendChild(el("path", {
-      class: "edge" + (e.synthetic ? " inherit" : ""), "data-c": e.child, "data-p": e.parent,
-      d: `M${x1},${y1} C${x1},${m} ${x2},${m} ${x2},${y2}`,
-      fill: "none", stroke: cssv("--line"), "stroke-width": 1.4, "marker-end": "url(#arrow)"
-    }));
-  }
-  for (const id of ids) {
-    const n = byId.get(id), p = pos.get(id), c = statusColor(n.status);
-    const g = el("g", { class: "node", "data-id": id, transform: `translate(${p.x},${p.y})`,
-                        style: "cursor:pointer" });
-    g.appendChild(el("rect", { width: p.w, height: p.h, rx: 9, fill: cssv("--panel"), stroke: c }));
-    g.appendChild(el("rect", { width: 4, height: p.h, rx: 2, fill: c }));
-    const slug = id.replace(/^\d{8}-/, ""), date = (id.match(/^(\d{4})(\d{2})(\d{2})/) || []).slice(1).join("-");
-    const label = (isImp(id) ? "★ " : "") + slug;
-    g.appendChild(el("text", { x: 14, y: 23, "font-size": 13, "font-weight": 600, fill: cssv("--fg") },
-                     label.length > 24 ? label.slice(0, 23) + "…" : label));
-    if ((n.reports || []).length) g.appendChild(el("text", { x: p.w - 16, y: 15, "font-size": 10,
-                                             fill: cssv("--running") }, "▤"));
-    g.appendChild(el("text", { x: 14, y: 41, "font-size": 11, fill: cssv("--mut") },
-                     [date, n.kind, n.status].filter(Boolean).join("  ·  ")));
+  for (const id of ALL_IDS) {
+    const g = el("g", { class: "node", "data-id": id });
+    g.appendChild(el("rect", { class: "box", width: W, height: H, rx: 9 }));
+    g.appendChild(el("rect", { class: "acc", width: 4, height: H, rx: 2 }));
+    g.appendChild(el("text", { class: "t1", x: 14, y: 23 }));
+    g.appendChild(el("text", { class: "rep", x: W - 16, y: 15 }, "▤"));
+    g.appendChild(el("text", { class: "t2", x: 14, y: 41 }));
     g.addEventListener("click", ev => { ev.stopPropagation(); nodeClick(id); });
+    NODE_EL.set(id, g);
     gNodes.appendChild(g);
   }
-  const defs = el("defs");
-  defs.appendChild(el("marker", { id: "arrow", viewBox: "0 0 10 10", refX: 9, refY: 5,
-    markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" },
-    [el("path", { d: "M0,0 L10,5 L0,10 z", fill: cssv("--line") })]));
-  svg.append(defs, gEdges, gNodes);
+  gBands.appendChild(el("line", { class: "band-line", id: "band-line" }));
+  gBands.appendChild(el("text", { class: "band-label", id: "band-top" }));
+  gBands.appendChild(el("text", { class: "band-label", id: "band-bot" }));
+  svg.append(defs, gBands, gEdges, gNodes);
   svg.setAttribute("width", "100%"); svg.setAttribute("height", "100%");
-  fit(width, height);
-  if (selected) highlight(selected);
+  refreshNodeStyles();
+}
+// Labels and colours come from the data, which marks (supersede, important) change in place.
+function refreshNodeStyles() {
+  for (const id of ALL_IDS) {
+    const n = byId.get(id), g = NODE_EL.get(id);
+    g.style.setProperty("--status", statusColor(n.status));
+    const slug = id.replace(/^\d{8}-/, ""), date = dateOf(n);   // recorded date, else the id's
+    const label = (isImp(id) ? "★ " : "") + slug;
+    g.querySelector(".t1").textContent = label.length > 24 ? label.slice(0, 23) + "…" : label;
+    g.querySelector(".t2").textContent = [date, n.kind, n.status].filter(Boolean).join("  ·  ");
+    g.querySelector(".rep").style.display = (n.reports || []).length ? "" : "none";
+  }
 }
 
+/* ---- two bands: greyed (out) above, focused below --------------------------------------- */
+const BAND_GAP = 120;
+function layoutBands(focus) {
+  const inIds = ALL_IDS.filter(id => focus.has(id)), outIds = ALL_IDS.filter(id => !focus.has(id));
+  const empty = { pos: new Map(), width: 0, height: 0 };
+  const top = outIds.length ? layout(outIds) : empty, bot = inIds.length ? layout(inIds) : empty;
+  const width = Math.max(top.width, bot.width, 1);
+  const pos = new Map(), dxTop = (width - top.width) / 2, dxBot = (width - bot.width) / 2;
+  top.pos.forEach((p, id) => pos.set(id, { x: p.x + dxTop, y: p.y, w: p.w, h: p.h }));
+  const yBot = outIds.length ? top.height + BAND_GAP : 0;
+  bot.pos.forEach((p, id) => pos.set(id, { x: p.x + dxBot, y: p.y + yBot, w: p.w, h: p.h }));
+  return {
+    pos, width, height: yBot + bot.height, nOut: outIds.length, nIn: inIds.length,
+    bot: inIds.length ? { x0: dxBot, y0: yBot, x1: dxBot + bot.width, y1: yBot + bot.height } : null,
+    divider: outIds.length && inIds.length ? top.height + BAND_GAP / 2 : null,
+  };
+}
+function setDivider(L) {
+  gBands.style.opacity = L.divider === null ? 0 : 1;
+  if (L.divider === null) return;
+  const line = document.getElementById("band-line");
+  line.setAttribute("x1", -40); line.setAttribute("x2", L.width + 40);
+  line.setAttribute("y1", L.divider); line.setAttribute("y2", L.divider);
+  const t = document.getElementById("band-top"), b = document.getElementById("band-bot");
+  const lx = L.bot ? L.bot.x0 : 0;             // labels sit at the focused band's left edge, which the camera frames
+  t.setAttribute("x", lx); t.setAttribute("y", L.divider - 9);
+  t.textContent = `↑ ${L.nOut} greyed out by the current filters`;
+  b.setAttribute("x", lx); b.setAttribute("y", L.divider + 17);
+  b.textContent = `↓ ${L.nIn} shown`;
+}
+
+/* ---- geometry from POS ------------------------------------------------------------------ */
+// A parent normally sits above its child (bottom -> top). A focused parent whose child was greyed
+// sits BELOW it; then the edge leaves the parent's top and enters the child's bottom, so the
+// arrowhead still arrives from outside the box instead of piercing it.
+function edgePath(a, b) {
+  const down = b.y >= a.y + a.h;
+  const x1 = a.x + a.w / 2, y1 = down ? a.y + a.h : a.y, x2 = b.x + b.w / 2, y2 = down ? b.y : b.y + b.h;
+  const m = (y1 + y2) / 2;
+  return `M${x1},${y1} C${x1},${m} ${x2},${m} ${x2},${y2}`;
+}
+function placeAll() {
+  for (const [id, p] of POS) NODE_EL.get(id).setAttribute("transform", `translate(${p.x},${p.y})`);
+  for (const e of EDGE_EL) {
+    const a = POS.get(e.parent), b = POS.get(e.child);
+    if (a && b) e.el.setAttribute("d", edgePath(a, b));
+  }
+  apply();
+}
+
+/* ---- animation: positions and camera move together ------------------------------------- */
+let anim = null, TARGET = null;   // TARGET = {pos, view} the current animation is heading to
+const ease = u => u < .5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+const MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 560;
+let animGuard = null;
+function snapToTarget() {
+  if (anim) { cancelAnimationFrame(anim); anim = null; }
+  if (TARGET) { POS = new Map(TARGET.pos); view = { ...TARGET.view }; placeAll(); }
+}
+document.addEventListener("visibilitychange", () => { if (document.hidden) snapToTarget(); });
+function animateTo(targetPos, targetView, ms) {
+  if (anim) { cancelAnimationFrame(anim); anim = null; }
+  clearTimeout(animGuard);
+  // a relayout that lands mid-animation starts from where things ARE, not where they were going
+  const from = new Map(ALL_IDS.map(id => [id, POS.get(id) || targetPos.get(id)]));
+  const v0 = { ...view };
+  TARGET = { pos: targetPos, view: targetView };
+  if (!ms) { POS = new Map(targetPos); view = { ...targetView }; placeAll(); return; }
+  const t0 = performance.now();
+  const step = now => {
+    const u = Math.min(1, (now - t0) / ms), e = ease(u);
+    for (const id of ALL_IDS) {
+      const a = from.get(id), b = targetPos.get(id);
+      POS.set(id, { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e, w: b.w, h: b.h });
+    }
+    view = { k: v0.k + (targetView.k - v0.k) * e, x: v0.x + (targetView.x - v0.x) * e, y: v0.y + (targetView.y - v0.y) * e };
+    placeAll();
+    if (u < 1) anim = requestAnimationFrame(step); else { anim = null; clearTimeout(animGuard); }
+  };
+  anim = requestAnimationFrame(step);
+  animGuard = setTimeout(snapToTarget, ms + 400);   // frames stopped coming (hidden tab, throttling)
+}
+
+/* ---- framing ---------------------------------------------------------------------------- */
 // ONE copy of the framing policy: pad, then floor the zoom at a LEGIBILITY limit rather than
 // always fitting — below ~0.55 the 13px labels stop being readable, and an unreadable overview is
 // worse than one you have to pan. Content beyond the viewport stays reachable by drag/scroll.
-function frameBox(x0, y0, x1, y1, pad, maxK) {
+function frameFor(x0, y0, x1, y1, pad, maxK) {
   // An empty graph (every node filtered out) has no extent: frame a fixed box instead of NaN.
   if (![x0, y0, x1, y1].every(Number.isFinite)) { x0 = 0; y0 = 0; x1 = 400; y1 = 200; }
   const r = document.getElementById("graph").getBoundingClientRect();
   const w = Math.max(x1 - x0, 1), h = Math.max(y1 - y0, 1);
   const k = Math.max(0.55, Math.min(maxK, (r.width - pad) / w, (r.height - pad) / h));
-  view = { k, x: r.width / 2 - k * (x0 + x1) / 2,
-              y: Math.max(pad / 2, r.height / 2 - k * (y0 + y1) / 2) };
-  apply();
+  // A box taller than the viewport (zoom floored) is pinned by its TOP edge, wherever it sits in
+  // the drawing; a box that fits is centred. (Clamping y to the padding, as before, silently
+  // showed the top of the whole drawing instead of a focused band lower down.)
+  const tall = k * h + pad > r.height;
+  return { k, x: r.width / 2 - k * (x0 + x1) / 2,
+              y: tall ? pad / 2 - k * y0 : r.height / 2 - k * (y0 + y1) / 2 };
 }
-const fit = (w, h) => frameBox(0, 0, w, h, 60, 1);
+function frameBox(x0, y0, x1, y1, pad, maxK) { view = frameFor(x0, y0, x1, y1, pad, maxK); apply(); }
 const apply = () => svg.setAttribute("viewBox",
   `${-view.x / view.k} ${-view.y / view.k} ${svg.clientWidth / view.k} ${svg.clientHeight / view.k}`);
+// Pan (at the current zoom) so a node you navigated to is on screen; a no-op when it already is.
+// Judged against where the layout is HEADING (a click can land mid-animation), and the layout
+// keeps heading there: only the camera target changes.
+function ensureVisible(id) {
+  const pos = TARGET ? TARGET.pos : POS, v = TARGET ? TARGET.view : view;
+  const p = pos.get(id); if (!p) return;
+  const r = document.getElementById("graph").getBoundingClientRect();
+  const vx = -v.x / v.k, vy = -v.y / v.k, vw = r.width / v.k, vh = r.height / v.k;
+  if (p.x >= vx && p.x + p.w <= vx + vw && p.y >= vy && p.y + p.h <= vy + vh) return;
+  animateTo(pos, { k: v.k, x: r.width / 2 - v.k * (p.x + p.w / 2), y: r.height / 2 - v.k * (p.y + p.h / 2) }, MOTION);
+}
+
+/* ---- THE entry point after any filter change -------------------------------------------- */
+// Recomputes the focus set, restyles, and — only when the set actually changed — lays the two
+// bands out again and animates everything to its new place, framing the focused band.
+function refilter(opts = {}) {
+  const focus = new Set(shownIds());
+  const changed = !FOCUS || focus.size !== FOCUS.size || [...focus].some(id => !FOCUS.has(id));
+  FOCUS = focus;
+  for (const [id, g] of NODE_EL) g.classList.toggle("out", !focus.has(id));
+  for (const e of EDGE_EL) e.el.classList.toggle("out", !(focus.has(e.parent) && focus.has(e.child)));
+  document.getElementById("count").textContent = countText();
+  if (!picking) hint.textContent = focus.size ? "drag to pan · scroll to zoom · click a node"
+                                              : "nothing matches the current filters — everything is greyed above";
+  if (changed || opts.force) {
+    const L = layoutBands(focus);
+    setDivider(L);
+    const b = L.bot || { x0: 0, y0: 0, x1: L.width, y1: L.height };   // frame the focused band, else everything
+    animateTo(L.pos, frameFor(b.x0, b.y0, b.x1, b.y1, 60, 1), opts.instant ? 0 : MOTION);
+  }
+  if (selected) highlight(selected);
+}
 
 /* ---- selection + relatives ------------------------------------------------------------- */
 // DIRECT neighbours only: the transitive ancestry cone lit up half the graph on well-connected
 // nodes and read as clutter. Deeper lineage stays one click away (the panel's parent/child links
 // walk it hop by hop) and `lab-exp lineage` prints it whole.
 function highlight(id) {
-  const hot = new Set([id, ...(EFF.parents.get(id) || parents.get(id) || []),
-                           ...(EFF.children.get(id) || children.get(id) || [])]);
-  svg.querySelectorAll(".node").forEach(g =>
-    g.classList.toggle("dim", !hot.has(g.dataset.id)));
-  svg.querySelectorAll(".edge").forEach(p => {
-    const on = (p.dataset.c === id && hot.has(p.dataset.p)) ||
-               (p.dataset.p === id && hot.has(p.dataset.c));
-    p.classList.toggle("dim", !on);
-    p.classList.toggle("hot", on);
-    p.setAttribute("stroke", on ? statusColor(byId.get(id).status) : cssv("--line"));
-  });
+  const hot = new Set([id, ...(parents.get(id) || []), ...(children.get(id) || [])]);
+  svg.style.setProperty("--hot", statusColor(byId.get(id).status));
+  for (const [nid, g] of NODE_EL) g.classList.toggle("dim", !hot.has(nid));
+  for (const e of EDGE_EL) {
+    const on = (e.child === id && hot.has(e.parent)) || (e.parent === id && hot.has(e.child));
+    e.el.classList.toggle("dim", !on);
+    e.el.classList.toggle("hot", on);
+    e.el.setAttribute("marker-end", on ? "url(#arrow-hot)" : "url(#arrow)");
+  }
 }
 function clearHighlight() {
   svg.querySelectorAll(".node,.edge").forEach(x => x.classList.remove("dim", "hot"));
-  svg.querySelectorAll(".edge").forEach(p => p.setAttribute("stroke", cssv("--line")));
-  applySearch();   // deselecting must not wipe an active search's highlighting
-}
-// Highlighting in place is only useful if you can SEE the highlights: this graph is routinely wider
-// than the viewport, so a search can report "29 / 190 match" with every match off-screen. Pan (and
-// zoom out, never past the legibility floor) to bring them into view -- but ONLY when none is
-// already visible, so typing doesn't yank a view you are reading out from under you.
-function frameMatches() {
-  if (!matched || !matched.size || !POS) return;
-  const r = document.getElementById("graph").getBoundingClientRect();
-  const vx = -view.x / view.k, vy = -view.y / view.k;
-  const vw = svg.clientWidth / view.k, vh = svg.clientHeight / view.k;
-  const boxes = [...matched].map(id => POS.get(id)).filter(Boolean);
-  if (!boxes.length) return;
-  if (boxes.some(b => b.x + b.w > vx && b.x < vx + vw && b.y + b.h > vy && b.y < vy + vh)) return;
-  frameBox(Math.min(...boxes.map(b => b.x)), Math.min(...boxes.map(b => b.y)),
-           Math.max(...boxes.map(b => b.x + b.w)), Math.max(...boxes.map(b => b.y + b.h)),
-           80, view.k);
-}
-// Search and selection are two lenses over the SAME drawing, both driven by classes rather than by
-// rebuilding: `hit`/`miss` belong to search, `hot`/`dim` to the selected node's lineage. The most
-// recent interaction wins, which is what makes clicking a result behave the way you expect.
-function applySearch() {
-  svg.querySelectorAll(".node").forEach(g => {
-    const on = !matched || matched.has(g.dataset.id);
-    g.classList.toggle("hit", !!matched && on);
-    g.classList.toggle("miss", !!matched && !on);
-  });
-  svg.querySelectorAll(".edge").forEach(p => {
-    const on = !matched || (matched.has(p.dataset.c) && matched.has(p.dataset.p));
-    p.classList.toggle("miss", !!matched && !on);
-  });
+  for (const e of EDGE_EL) e.el.setAttribute("marker-end", "url(#arrow)");
 }
 
 const side = document.getElementById("side");
@@ -509,9 +577,7 @@ function applyLocal(id, status, by) {
   const n = byId.get(id);
   n.status = status; n.superseded_by = by;
   if (status === "superseded") SUP.add(id); else SUP.delete(id);
-  refreshSup();
-  draw();
-  document.getElementById("count").textContent = countText();
+  refreshSup(); refreshNodeStyles(); refilter({ force: true });
   select(id);
 }
 async function doSupersede(oldId, byId_) {
@@ -531,11 +597,7 @@ function nodeClick(id) {
 }
 
 function select(id) {
-  if (SUP.has(id) && !showSup) {           // parent/child link into hidden territory: reveal it
-    const cb = document.getElementById("showsup");
-    cb.checked = true; cb.dispatchEvent(new Event("change"));
-  }
-  selected = id; highlight(id);
+  selected = id; highlight(id); ensureVisible(id);   // greyed nodes are selectable too
   const n = byId.get(id);
   const rel = (ids, label) => ids.length ? `<div class="meta" style="margin-top:.6rem">${label}</div>
     <div class="rel">${ids.map(i => `<a href="#" data-go="${esc(i)}">${esc(i)}</a>`).join("")}</div>` : "";
@@ -576,7 +638,7 @@ function select(id) {
     const res = await api("/important", { id, on: !isImp(id) });
     if (!res) return;
     byId.get(id).tags = res.tags;      // server returns the canonical string -- no client surgery
-    refreshImp(); draw(); select(id);
+    refreshImp(); refreshNodeStyles(); refilter({ force: true }); select(id);
   });
   side.scrollTop = 0;
 }
@@ -603,18 +665,15 @@ function md(src) {
 
 /* ---- filter, pan, zoom ----------------------------------------------------------------- */
 const q = document.getElementById("q");
+let qTimer = null;
 q.addEventListener("input", () => {
-  const t = q.value.trim().toLowerCase();
-  matched = !t ? null : new Set(NODES.filter(n => visible(n.id)).filter(n =>
-    [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
-  const nShown = shownIds().length;
-  const hits = matched ? matched.size : nShown;
-  document.getElementById("count").textContent =
-    matched ? `${hits} / ${nShown} match` : countText();
-  // A search supersedes the selected node's lineage highlighting, but keeps the side panel — you
-  // are usually searching for the NEXT thing to open, not discarding what you just read.
-  clearHighlight();   // also re-applies the search classes
-  frameMatches();
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => {
+    const t = q.value.trim().toLowerCase();
+    matched = !t ? null : new Set(NODES.filter(n =>
+      [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
+    refilter();
+  }, 90);
 });
 // Escape clears the search from anywhere — otherwise a stray query leaves the graph dimmed with no
 // obvious way back except selecting the text.
@@ -665,18 +724,24 @@ gdiv.addEventListener("wheel", e => {
 // would deselect whatever you were reading.
 svg.addEventListener("click", () => {
   if (dragged) { dragged = false; return; }
-  selected = null; clearHighlight();
+  selected = null; clearHighlight(); setPicking(null);
   side.className = "empty"; side.innerHTML = "<div>Select an experiment to read its README.</div>";
 });
 addEventListener("resize", () => apply());
+if (window.ResizeObserver) new ResizeObserver(() => apply()).observe(gdiv);
 
 document.getElementById("legend").innerHTML =
   [...new Set(NODES.map(n => n.status).filter(Boolean))].sort()
     .map(s => `<span><i style="background:${statusColor(s)}"></i>${esc(s)}</span>`).join("");
-const countText = () => (showSup || !SUP.size ? `${shownIds().length} experiments`
-  : `${shownIds().length} experiments (${SUP.size} superseded hidden)`)
-  + (impOnly ? " · important only" : "")
-  + (dateFrom || dateTo ? ` · ${dateFrom || "…"} → ${dateTo || "…"}` : "");
+const countText = () => {
+  const n = FOCUS ? FOCUS.size : ALL_IDS.length, out = ALL_IDS.length - n, parts = [];
+  parts.push(out ? `${n} of ${ALL_IDS.length} shown · ${out} greyed above` : `${n} experiments`);
+  if (!showSup && SUP.size) parts.push(`${SUP.size} superseded`);
+  if (impOnly) parts.push("important only");
+  if (dateFrom || dateTo) parts.push(`${dateFrom || "…"} → ${dateTo || "…"}`);
+  if (matched) parts.push(`matching “${q.value.trim()}”`);
+  return parts.join(" · ");
+};
 function refreshSup() {
   document.getElementById("suplabel").style.display = SUP.size ? "" : "none";
   document.getElementById("supn").textContent = SUP.size;
@@ -691,9 +756,7 @@ refreshSup();
 if (SUP.size) {
   document.getElementById("showsup").addEventListener("change", ev => {
     showSup = ev.target.checked;
-    if (selected && SUP.has(selected) && !showSup) { selected = null; }
-    draw();
-    q.dispatchEvent(new Event("input"));   // re-runs the search AND recomputes the count
+    refilter();
   });
 }
 refreshImp();
@@ -712,23 +775,19 @@ if (INTENTS) {
   });
   document.getElementById("int-clear").addEventListener("click", () => {
     PENDING.slice().reverse().forEach(revertIntent); PENDING = []; savePending();
-    refreshSup(); refreshImp(); draw(); document.getElementById("count").textContent = countText();
+    refreshSup(); refreshImp(); refreshNodeStyles(); refilter({ force: true });
     if (selected) select(selected);
   });
 }
 document.getElementById("imponly").addEventListener("change", ev => {
   impOnly = ev.target.checked;
-  if (selected && impOnly && !isImp(selected)) selected = null;
-  draw();
-  q.dispatchEvent(new Event("input"));   // re-runs the search AND recomputes the count
+  refilter();
 });
 function setDates(from, to) {
   dateFrom = from; dateTo = to;
   document.getElementById("datefrom").value = from;
   document.getElementById("dateto").value = to;
-  if (selected && !visible(selected)) selected = null;
-  draw();
-  q.dispatchEvent(new Event("input"));   // re-runs the search AND recomputes the count
+  refilter();
 }
 const isoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 document.getElementById("datepre").addEventListener("change", ev => {
@@ -742,8 +801,8 @@ document.getElementById("datepre").addEventListener("change", ev => {
 for (const id of ["datefrom", "dateto"])
   document.getElementById(id).addEventListener("change", () =>
     setDates(document.getElementById("datefrom").value, document.getElementById("dateto").value));
-document.getElementById("count").textContent = countText();
-draw();
+buildDom();
+refilter({ instant: true });
 /* ---- deep links: ?days=7 | ?from=YYYY-MM-DD&to=YYYY-MM-DD | ?q=<text> | ?important=1 ----------
    So a note or a digest can link straight to "this week's experiments" or to one experiment.
    Works behind the hub's lock page too: decryption rewrites the document, not the URL. */
@@ -766,6 +825,10 @@ draw();
     if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event("change")); }
   }
   if (P.get("q")) { q.value = P.get("q"); q.dispatchEvent(new Event("input")); }
+  // a deep link should land already filtered: skip the search debounce
+  if (P.get("q")) { clearTimeout(qTimer); const t = q.value.trim().toLowerCase();
+    matched = new Set(NODES.filter(n => [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
+    refilter(); }
 })();
 </script>
 </body></html>
