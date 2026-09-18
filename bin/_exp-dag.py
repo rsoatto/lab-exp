@@ -61,6 +61,10 @@ TEMPLATE = r"""<!doctype html>
  input[type=search] { flex:1; min-width:10rem; max-width:22rem; padding:.4rem .6rem; font:inherit;
    border:1px solid var(--line); border-radius:7px; background:var(--panel); color:inherit; }
  .legend { display:flex; gap:.7rem; font-size:.8rem; color:var(--mut); flex-wrap:wrap; }
+ #datef { align-items:center; gap:.4rem; }
+ #datef select, #datef input[type=date] { font:inherit; font-size:.85rem; padding:.25rem .4rem; border:1px solid var(--line);
+   border-radius:6px; background:var(--panel); color:inherit; }
+ #datef input[type=date] { max-width:9.5rem; }
  .legend i { display:inline-block; width:.62rem; height:.62rem; border-radius:50%; margin-right:.28rem;
              vertical-align:middle; }
  main { flex:1; display:flex; min-height:0; }
@@ -121,6 +125,10 @@ TEMPLATE = r"""<!doctype html>
 <header>
   <h1>__TITLE__</h1><span class="count" id="count"></span>
   <input type="search" id="q" placeholder="filter by id, tag, kind, finding…">
+  <span class="legend" id="datef"><select id="datepre" title="filter by experiment date">
+      <option value="">all dates</option><option value="7">last 7 days</option><option value="30">last 30 days</option>
+      <option value="90">last 90 days</option><option value="custom">custom range…</option></select>
+    <span id="daterange" style="display:none"><input type="date" id="datefrom"> – <input type="date" id="dateto"></span></span>
   <label class="legend" id="implabel" style="display:none;cursor:pointer"><input type="checkbox" id="imponly"> ★ important only (<span id="impn"></span>)</label>
   <label class="legend" id="suplabel" style="display:none;cursor:pointer"><input type="checkbox" id="showsup"> show superseded (<span id="supn"></span>)</label>
   <span class="legend" id="legend"></span>
@@ -232,6 +240,14 @@ const tagsOf = n => (n.tags || "").split(",").map(t => t.trim()).filter(Boolean)
 const isImp = id => tagsOf(byId.get(id)).includes("important");
 const impCount = () => ALL_IDS.filter(isImp).length;
 let showSup = false, impOnly = false;
+let dateFrom = "", dateTo = "";      // inclusive YYYY-MM-DD bounds; "" = open. Filters by experiment date.
+const dateOf = n => (n.date || "").slice(0, 10)
+  || ((m => m ? `${m[1]}-${m[2]}-${m[3]}` : "")(/^(\d{4})(\d{2})(\d{2})-/.exec(n.id)));
+const inDate = id => {
+  if (!dateFrom && !dateTo) return true;
+  const d = dateOf(byId.get(id));
+  return !!d && (!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo);
+};
 
 /* ---- queued marks (static pages with INTENTS) ------------------------------------------- */
 // The view applies a mark immediately; the boxes apply it later. Reconciled on every load: a mark
@@ -296,7 +312,7 @@ function afterMark(id) {
 }
 // THE visibility predicate -- the only definition. Search and drawing both use it; a new filter
 // gets added here once.
-const visible = id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id));
+const visible = id => (showSup || !SUP.has(id)) && (!impOnly || isImp(id)) && inDate(id);
 const shownIds = () => ALL_IDS.filter(visible);
 
 function el(t, a = {}, kids = []) {
@@ -356,6 +372,8 @@ function draw() {
   for (const e of eff) { ep.get(e.child).push(e.parent); ec.get(e.parent).push(e.child); }
   EFF = { parents: ep, children: ec };
   const { pos, width, height } = layout(ids, ep);
+  if (!ids.length) hint.textContent = "no experiments match the current filters";
+  else if (!picking) hint.textContent = "drag to pan · scroll to zoom · click a node";
   POS = pos;
   svg.replaceChildren();
   const gEdges = el("g"), gNodes = el("g");
@@ -401,6 +419,8 @@ function draw() {
 // always fitting — below ~0.55 the 13px labels stop being readable, and an unreadable overview is
 // worse than one you have to pan. Content beyond the viewport stays reachable by drag/scroll.
 function frameBox(x0, y0, x1, y1, pad, maxK) {
+  // An empty graph (every node filtered out) has no extent: frame a fixed box instead of NaN.
+  if (![x0, y0, x1, y1].every(Number.isFinite)) { x0 = 0; y0 = 0; x1 = 400; y1 = 200; }
   const r = document.getElementById("graph").getBoundingClientRect();
   const w = Math.max(x1 - x0, 1), h = Math.max(y1 - y0, 1);
   const k = Math.max(0.55, Math.min(maxK, (r.width - pad) / w, (r.height - pad) / h));
@@ -654,7 +674,8 @@ document.getElementById("legend").innerHTML =
     .map(s => `<span><i style="background:${statusColor(s)}"></i>${esc(s)}</span>`).join("");
 const countText = () => (showSup || !SUP.size ? `${shownIds().length} experiments`
   : `${shownIds().length} experiments (${SUP.size} superseded hidden)`)
-  + (impOnly ? " · important only" : "");
+  + (impOnly ? " · important only" : "")
+  + (dateFrom || dateTo ? ` · ${dateFrom || "…"} → ${dateTo || "…"}` : "");
 function refreshSup() {
   document.getElementById("suplabel").style.display = SUP.size ? "" : "none";
   document.getElementById("supn").textContent = SUP.size;
@@ -700,6 +721,26 @@ document.getElementById("imponly").addEventListener("change", ev => {
   draw();
   q.dispatchEvent(new Event("input"));   // re-runs the search AND recomputes the count
 });
+function setDates(from, to) {
+  dateFrom = from; dateTo = to;
+  document.getElementById("datefrom").value = from;
+  document.getElementById("dateto").value = to;
+  if (selected && !visible(selected)) selected = null;
+  draw();
+  q.dispatchEvent(new Event("input"));   // re-runs the search AND recomputes the count
+}
+const isoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+document.getElementById("datepre").addEventListener("change", ev => {
+  const v = ev.target.value;
+  document.getElementById("daterange").style.display = v === "custom" ? "" : "none";
+  if (v === "custom") return;                        // bounds come from the two inputs
+  if (!v) return setDates("", "");
+  const from = new Date(); from.setDate(from.getDate() - Number(v) + 1);   // "last 7 days" includes today
+  setDates(isoDay(from), "");
+});
+for (const id of ["datefrom", "dateto"])
+  document.getElementById(id).addEventListener("change", () =>
+    setDates(document.getElementById("datefrom").value, document.getElementById("dateto").value));
 document.getElementById("count").textContent = countText();
 draw();
 </script>
