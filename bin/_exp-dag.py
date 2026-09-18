@@ -106,25 +106,30 @@ TEMPLATE = r"""<!doctype html>
  .md pre code { background:none; padding:0; }
  .md hr { border:0; border-top:1px solid var(--line); margin:1rem 0; }
  svg text { user-select:none; }
- /* Every node is always drawn. --status is set inline per node; --c is what the shapes use, so a
-    class can recolor a node without fighting the inline style. */
- .node { cursor:pointer; --c: var(--status); transition: opacity .35s ease; }
+ /* Every node is always drawn. --status is set inline per node; the shapes read --c / --t1 / --t2,
+    so a class recolours a node without fighting the inline style. Fading is done with COLOURS,
+    never group opacity: an SVG group with opacity < 1 needs its own offscreen buffer, and a click
+    that set that on 400 nodes at once (plus a transition) blinked the whole drawing. */
+ .node { cursor:pointer; --c: var(--status); --t1: var(--fg); --t2: var(--mut); }
  .node rect.box { fill:var(--panel); stroke:var(--c); stroke-width:1.5px; transition: stroke .3s; }
  .node rect.acc { fill:var(--c); transition: fill .3s; }
- .node text.t1 { font-size:13px; font-weight:600; fill:var(--fg); transition: fill .3s; }
- .node text.t2 { font-size:11px; fill:var(--mut); }
- .node text.rep { font-size:10px; fill:var(--running); }
+ .node text.t1 { font-size:13px; font-weight:600; fill:var(--t1); transition: fill .3s; }
+ .node text.t2 { font-size:11px; fill:var(--t2); transition: fill .3s; }
+ .node text.rep { font-size:10px; fill:var(--t2); }
  /* OUT = fails a filter (superseded, important-only, date, search): greyed and laid out in the band
     ABOVE the focused nodes, but still drawn, so a focused node's lineage can be traced into it. */
- .node.out { opacity:.45; --c: var(--mut); }
- .node.out text.t1 { fill:var(--mut); }
- .edge { stroke:var(--line); stroke-width:1.4px; fill:none; transition: opacity .35s ease, stroke .2s; }
- .edge.out { opacity:.32; }
- /* selection lens: direct neighbours stay, everything else fades further */
- .node.dim { opacity:.12; }
- .edge.dim { opacity:.05; }
- .edge.hot { stroke:var(--hot, var(--fg)); stroke-width:2.2px; opacity:1; }
+ .node.out { --c: color-mix(in srgb, var(--mut) 45%, var(--bg)); --t1: color-mix(in srgb, var(--fg) 42%, var(--bg));
+             --t2: color-mix(in srgb, var(--mut) 55%, var(--bg)); }
+ /* selection lens: direct neighbours stay, everything else fades further (colours again) */
+ .node.dim { --c: color-mix(in srgb, var(--mut) 22%, var(--bg)); --t1: color-mix(in srgb, var(--fg) 16%, var(--bg));
+             --t2: color-mix(in srgb, var(--mut) 22%, var(--bg)); }
+ .edge { stroke:var(--line); stroke-width:1.4px; fill:none; marker-end:url(#arrow);
+         transition: stroke .3s, stroke-opacity .3s; }
+ .edge.out { stroke-opacity:.35; marker-end:url(#arrow-faint); }
+ .edge.dim { stroke-opacity:.12; marker-end:url(#arrow-faint); }
+ .edge.hot { stroke:var(--hot, var(--fg)); stroke-width:2.2px; stroke-opacity:1; marker-end:url(#arrow-hot); }
  #arrow path { fill:var(--line); }
+ #arrow-faint path { fill:color-mix(in srgb, var(--line) 35%, var(--bg)); }
  #arrow-hot path { fill:var(--hot, var(--fg)); }
  .band-line { stroke:var(--line); stroke-dasharray:7 6; stroke-width:1.2px; }
  .band-label { font-size:11px; fill:var(--mut); letter-spacing:.02em; }
@@ -358,13 +363,13 @@ const gBands = el("g", { class: "bands" }), gEdges = el("g"), gNodes = el("g");
 const NODE_EL = new Map(), EDGE_EL = [];
 function buildDom() {
   const defs = el("defs");
-  for (const mid of ["arrow", "arrow-hot"])
+  for (const mid of ["arrow", "arrow-faint", "arrow-hot"])
     defs.appendChild(el("marker", { id: mid, viewBox: "0 0 10 10", refX: 9, refY: 5,
       markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" },
       [el("path", { d: "M0,0 L10,5 L0,10 z" })]));
   for (const e of EDGES) {
     if (!byId.has(e.child) || !byId.has(e.parent) || e.child === e.parent) continue;   // dangling edge: registry pruned it
-    const p = el("path", { class: "edge", "data-c": e.child, "data-p": e.parent, "marker-end": "url(#arrow)" });
+    const p = el("path", { class: "edge", "data-c": e.child, "data-p": e.parent });
     EDGE_EL.push({ el: p, parent: e.parent, child: e.child });
     gEdges.appendChild(p);
   }
@@ -582,12 +587,10 @@ function highlight(id) {
     const on = (e.child === id && hot.has(e.parent)) || (e.parent === id && hot.has(e.child));
     e.el.classList.toggle("dim", !on);
     e.el.classList.toggle("hot", on);
-    e.el.setAttribute("marker-end", on ? "url(#arrow-hot)" : "url(#arrow)");
   }
 }
 function clearHighlight() {
   svg.querySelectorAll(".node,.edge").forEach(x => x.classList.remove("dim", "hot"));
-  for (const e of EDGE_EL) e.el.setAttribute("marker-end", "url(#arrow)");
 }
 
 const side = document.getElementById("side");
