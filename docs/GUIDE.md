@@ -79,7 +79,10 @@ project/
    `out/run-meta.json` (git SHA — commit first, dirty trees are flagged — exact command, host,
    GPUs) and sets all wandb env vars (your code just calls `wandb.init()` bare). When it finishes:
    `lab-exp done <id> --finding "..." --metrics k=v,...` — an experiment without a recorded
-   finding is unfinished. If the experiment warrants human-facing reports (figures, writeups),
+   finding is unfinished. Repeatable `--follow-up "..."` appends `- [ ] ...` checklist lines under
+   the README's `## Follow-ups` section (created if missing, never duplicated) for anything a human
+   should pick up later — a check to run, a question to raise, a next experiment. If the experiment
+   warrants human-facing reports (figures, writeups),
    write them as SELF-CONTAINED HTML under `out/` — `out/report.html` for the primary one,
    `out/viz/<name>.html` for additional views. The DAG page surfaces every .html at out/ top level
    or one subdir deep (▤ marker on the node, links in the panel, primary first). **That is where a
@@ -241,9 +244,11 @@ No auth on the box → automatic `WANDB_MODE=offline` (the user drops a key in
 ## Sharing a repo with people who don't use lab-exp
 
 lab-exp is optional per contributor. The only shared contract is the **README front-matter**
-(`id`, `kind`, `tags`, `based_on`, `produces`, …); everything lab-exp records (`status`, `date`,
+(`id`, `kind`, `tags`, `based_on`, `produces`, `notes`, …); everything lab-exp records (`status`, `date`,
 `git_sha`, `metrics`, `finding`, `superseded_by`, …) is written into that same block, additively,
-never touching the body. Consequences:
+never touching the body. `notes` (optional: a vault wikilink or path to the note that motivated
+the experiment) is authored the same way — `lab-exp new --notes` fills it in, or edit it by hand —
+and lab-exp only ever reads it back, never writes it. Consequences:
 
 - **The registry TSV is a cache, not a record.** New projects gitignore it; `lab-exp registry
   --rebuild` regenerates it from the READMEs (and `--sync` first pushes older cached facts into

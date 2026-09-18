@@ -541,6 +541,7 @@ function select(id) {
     <div class="rel">${ids.map(i => `<a href="#" data-go="${esc(i)}">${esc(i)}</a>`).join("")}</div>` : "";
   const kv = [["kind", n.kind], ["status", n.status], ["date", n.date], ["agent", n.agent],
               ["host", n.host], ["git", n.git_sha], ["metrics", n.metrics], ["dir", n.dir],
+              ["notes", (n.notes || "").trim()],
               ["superseded by", (n.superseded_by || "").trim()]]
     .filter(([, v]) => v).map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("");
   side.className = "";

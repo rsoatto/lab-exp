@@ -19,7 +19,7 @@ process, so projects never import this framework and `python run.py` always work
   lab-exp projects                    # all lab-exp projects on this machine
 
 Per-project knobs live in .lab-exp.toml (written by init, edited by hand, never guessed).
-Registry columns: id date kind status agent host git_sha based_on tags metrics finding wandb
+Registry columns: id date kind status agent host git_sha based_on tags metrics finding wandb superseded_by notes
 """
 import argparse
 import ast
@@ -42,8 +42,10 @@ from pathlib import Path
 
 CONFIG_NAME = ".lab-exp.toml"
 REG_COLS = ["id", "date", "kind", "status", "agent", "host", "git_sha",
-            "based_on", "tags", "metrics", "finding", "wandb", "superseded_by"]
-# superseded_by appended 2026-08: reg_read pads short rows, so old registries need no migration.
+            "based_on", "tags", "metrics", "finding", "wandb", "superseded_by", "notes"]
+# superseded_by (2026-08) / notes (2026-09) appended at the end: reg_read pads short rows, so old
+# registries need no migration. notes is README-owned (like title): never in FRONT_KEYS below, so
+# reg_sync/front_mirror never write it back -- it flows README -> registry only, one-way.
 # Machine-local state -> ~/.config/lab (NOT ~/lab, which is rsync-deployed from the laptop: a
 # registry living there gets clobbered by every deploy and leaks one machine's projects onto another).
 PROJECTS_TSV = Path.home() / ".config" / "lab" / "exp-projects.tsv"
@@ -109,6 +111,7 @@ def load_cfg(root):
     cfg.setdefault("env", {})
     cfg.setdefault("run", {})
     cfg.setdefault("wandb", {})
+    cfg.setdefault("links", {})
     return cfg
 
 
@@ -640,6 +643,12 @@ site = "{site}"                # cw | exxact | mac — informational; registries
 kinds = ["training", "analysis"]   # allowed experiment kinds; `new --kind` must be one of these
 tag_keys = []                  # structured tag keys usable in viz MATCH, e.g. ["arch", "objective"]
 
+# [links]                      # optional: arbitrary label = "url" pairs rendered as small anchors
+                               #   on this project's card in `lab-exp hub`. Only http(s):// and
+                               #   obsidian:// URLs render; anything else is silently skipped.
+# notes = "obsidian://open?vault=Obsidian%20Vault&file=Meeting%20%26%20Working%20Notes%2FALS"
+# wiki = "obsidian://open?vault=Obsidian%20Vault&file=Wikis%2FMyProject"
+
 [paths]
 # data = ["/mnt/data/..."]     # where the datasets live (informational, for READMEs/doctor)
 scratch = "{scratch}"          # big/ephemeral outputs + WANDB_DIR live here, not in git
@@ -680,7 +689,7 @@ title: {title}
 kind: {kind}
 tags: {tags}
 based_on: {based_on}
-produces: metrics.json
+{notes_line}produces: metrics.json
 ---
 
 # {title}
@@ -705,6 +714,9 @@ produces: metrics.json
 <!-- Filled by `lab-exp done --finding`. Lead with the answer to the hypothesis in one sentence,
      then the supporting number with its comparison and sample size, then caveats.
      A conclusion, not a log. -->
+
+## Follow-ups
+<!-- Optional. One "- [ ] ..." line per thing a human should pick up from this experiment (a check to run, a question to raise, a next experiment). Tooling outside lab-exp mirrors these into the project's notes; leave the section empty or delete it if there are none. -->
 """
 
 RUN_GENERIC = '''\
@@ -1033,9 +1045,11 @@ def cmd_new(a):
     (d / "out").mkdir()
     pkg = cfg["project"].get("package", "lib")
     title = a.title or slug.replace("-", " ")
+    notes = (a.notes or "").strip()
     subs = dict(id=eid, title=title, kind=a.kind, tags=", ".join(tags) or "none",
                 based_on=(a.based_on or "none").replace(",", ", "),
-                primary_parent=(split_list(a.based_on)[:1] or [""])[0], pkg=pkg)
+                primary_parent=(split_list(a.based_on)[:1] or [""])[0], pkg=pkg,
+                notes_line=(f"notes: {notes}\n" if notes else ""))
     # per-project template dir wins over the built-ins
     tdir = root / "experiments" / "_templates" / a.kind
     if (tdir / "README.md").is_file():
@@ -1054,7 +1068,7 @@ def cmd_new(a):
     (d / "run.py").write_text(runpy)
     reg_upsert(root, dict(id=eid, date=str(date.today()), kind=a.kind, status="planned",
                           agent=agent_name(), host=socket.gethostname().split(".")[0],
-                          based_on=a.based_on or "", tags=",".join(tags)))
+                          based_on=a.based_on or "", tags=",".join(tags), notes=notes))
     print(f"created experiments/{eid}/  (kind={a.kind})")
     print(f"  1. write Hypothesis + Method in its README.md   2. implement run.py   3. lab-exp run {eid}")
     if a.based_on:
@@ -1288,6 +1302,22 @@ def append_result_note(readme, note):
     readme.write_text(txt)
 
 
+def append_followups(readme, items):
+    """Append `- [ ] TEXT` lines under the README's ## Follow-ups section (creating it at the end
+    of the file if absent) -- same shape as append_result_note. Skips any line already present
+    verbatim, so repeated `done --follow-up` calls never duplicate."""
+    if not readme.is_file() or not items:
+        return
+    txt = readme.read_text()
+    new = [f"- [ ] {t}" for t in items if f"- [ ] {t}" not in txt]
+    if not new:
+        return
+    note = "\n" + "\n".join(new) + "\n"
+    txt = (txt.replace("## Follow-ups", "## Follow-ups" + note, 1) if "## Follow-ups" in txt
+           else txt + "\n## Follow-ups\n" + "\n".join(new) + "\n")
+    readme.write_text(txt)
+
+
 def cmd_done(a):
     root = find_root(a.root)
     d = exp_dir(root, a.id)
@@ -1300,6 +1330,8 @@ def cmd_done(a):
         append_result_note(d / "README.md",
                            f"\n**{a.status}** ({date.today()}): {a.finding}"
                            + (f"  \nmetrics: {metrics}" if metrics else "") + "\n")
+    if a.follow_up:
+        append_followups(d / "README.md", a.follow_up)
     # check declared produces (same nested-aware matching as viz REQUIRES)
     produced = out_artifacts(d / "out")
     missing = [p for p in split_list(read_front(d / "README.md").get("produces", ""))
@@ -1880,7 +1912,9 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:#666;font-size:13px;margin:0 0 18px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
 a.card{display:block;border:1px solid #ddd;border-radius:10px;padding:14px 16px;background:#fff;text-decoration:none;color:inherit}
 a.card:hover{border-color:#888}.name{font-weight:600;font-size:16px}.meta{color:#666;font-size:13px;margin-top:6px}
-.n{font-variant-numeric:tabular-nums}.recent{margin-top:8px;font-size:13px}.recent li{margin:2px 0}</style>
+.n{font-variant-numeric:tabular-nums}.recent{margin-top:8px;font-size:13px}.recent li{margin:2px 0}
+.cardwrap{display:block}.links{margin:-6px 0 10px;padding:0 2px;font-size:13px}
+.links a{color:#2f6fd0;text-decoration:none;margin-right:10px}.links a:hover{text-decoration:underline}</style>
 <h1>lab-exp hub</h1><p class="sub">{machine} · generated {when}. Click a project for its experiment DAG; reports open from a node's panel.</p>
 <div class="grid">{cards}</div>"""
 
@@ -1959,6 +1993,19 @@ def cmd_intents(a):
     sys.exit(3 if any(v == "FAIL" for v, _l, _d in results) else 0)
 
 
+def hub_card_links(links):
+    """Small anchors for a project's [links] table in .lab-exp.toml (arbitrary label = "url"
+    pairs) -- only http(s) and obsidian: URLs render, anything else is silently skipped (more
+    likely a typo than a link meant to be clicked from the hub). Both label and href are escaped."""
+    out = []
+    for label, url in (links or {}).items():
+        url = str(url)
+        if not re.match(r"^(https?|obsidian):", url, re.I):
+            continue
+        out.append(f'<a href="{_html.escape(url, quote=True)}">{_html.escape(str(label))}</a>')
+    return "".join(out)
+
+
 def cmd_hub(a):
     """A STATIC multi-project site: an index of every lab-exp project registered on this machine,
     one DAG page per project, and every experiment report (out/*.html, one subdir deep) copied
@@ -2014,11 +2061,18 @@ def cmd_hub(a):
         for r in rows:
             by_status[r.get("status", "")] = by_status.get(r.get("status", ""), 0) + 1
         st = ", ".join(f"{v} {k}" for k, v in sorted(by_status.items(), key=lambda kv: -kv[1]))
-        cards.append(f'<a class="card" href="{slug}/"><div class="name">{_html.escape(name)}</div>'
-                     f'<div class="meta"><span class="n">{len(rows)}</span> experiments ({_html.escape(st)}) · '
-                     f'<span class="n">{n_rep}</span> reports{f" · {n_big} too large" if n_big else ""}'
-                     f'<br>{_html.escape(str(root))}</div>'
-                     + (f'<ul class="recent">{rec}</ul>' if rec else "") + "</a>")
+        # The card itself is an <a>, so the [links] anchors below cannot nest inside it (nested <a>
+        # is invalid HTML) -- they render as a sibling row in a wrapping .cardwrap instead, right
+        # after the card, so they still read as one more line of the card's meta.
+        card_a = (f'<a class="card" href="{slug}/"><div class="name">{_html.escape(name)}</div>'
+                 f'<div class="meta"><span class="n">{len(rows)}</span> experiments ({_html.escape(st)}) · '
+                 f'<span class="n">{n_rep}</span> reports{f" · {n_big} too large" if n_big else ""}'
+                 f'<br>{_html.escape(str(root))}</div>'
+                 + (f'<ul class="recent">{rec}</ul>' if rec else "") + "</a>")
+        link_anchors = hub_card_links(cfg.get("links", {}))
+        cards.append(f'<div class="cardwrap">{card_a}'
+                     + (f'<div class="links">{link_anchors}</div>' if link_anchors else "")
+                     + "</div>")
         print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
     (out / "index.html").write_text(HUB_INDEX.replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
                                     .replace("{when}", datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -2639,6 +2693,9 @@ def main():
     s.add_argument("--tags", help="comma-separated, structured keys as k:v")
     s.add_argument("--based-on", help="parent experiment id(s), comma-separated (multiple parents = a DAG)")
     s.add_argument("--title")
+    s.add_argument("--notes", help="a vault wikilink or path to the note that motivated this "
+                   "experiment; written into the README front-matter (README-owned like title, "
+                   "never rewritten by reg_sync)")
 
     s = sub.add_parser("run", help="stamp + launch an experiment")
     s.add_argument("id")
@@ -2670,6 +2727,10 @@ def main():
     s.add_argument("--finding", help="the finding, for the registry and README: answer the hypothesis in one plain "
                    "sentence, then the supporting number with its comparison (e.g. '0.91 AUROC vs 0.87 baseline, 5 seeds')")
     s.add_argument("--metrics", help="k=v,k=v key scalars")
+    s.add_argument("--follow-up", dest="follow_up", action="append", default=None,
+                   help='a "- [ ] ..." checklist line to append under ## Follow-ups -- a check to '
+                        "run, a question to raise, a next experiment (repeatable; never duplicates "
+                        "a line already present verbatim)")
 
     s = sub.add_parser("adopt", help="declare an external artifact this experiment adopts (hash-recorded)")
     s.add_argument("id")

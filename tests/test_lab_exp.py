@@ -400,5 +400,66 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("note", r.stdout.split("26 MB > 25 MB hub cap")[0].splitlines()[-1])   # a note, not an issue
 
 
+    # ---- [links] hub card, notes front-matter, ## Follow-ups ----------------------------------
+
+    def test_hub_links_render_as_sibling_not_nested(self):
+        """The card is itself an <a>, so [links] anchors can't nest inside it (invalid HTML) --
+        they must render as a sibling row, still on the card."""
+        self.p.init()
+        self.p.new("base")
+        with open(self.p.root / ".lab-exp.toml", "a") as fh:
+            fh.write('\n[links]\nnotes = "obsidian://open?vault=Obsidian%20Vault&file=ALS"\n'
+                     'bad = "javascript:alert(1)"\n')
+        site = self.p.tmp / "site"
+        self.p.run("hub", "--out", str(site))
+        idx = (site / "index.html").read_text()
+        self.assertIn('<a href="obsidian://open?vault=Obsidian%20Vault&amp;file=ALS">notes</a>', idx)
+        self.assertNotIn("javascript:", idx)                 # disallowed scheme silently skipped
+        card = re.search(r'<a class="card"[^>]*>.*?</a>', idx, re.S)
+        self.assertIsNotNone(card)
+        self.assertNotIn("<a href=\"obsidian:", card.group(0))   # links anchor is NOT nested inside it
+
+    def test_new_notes_flows_to_registry_on_rebuild(self):
+        self.p.init()
+        a = self.p.new("base", notes="[[ALS/Experiment Journal]]")
+        self.assertEqual(front(self.p.readme(a))["notes"], "[[ALS/Experiment Journal]]")
+        self.assertEqual(read_tsv(self.p.tsv)[a]["notes"], "[[ALS/Experiment Journal]]")
+        self.p.run("registry", "--rebuild")
+        self.assertEqual(read_tsv(self.p.tsv)[a]["notes"], "[[ALS/Experiment Journal]]")
+        # notes is README-owned: a sync never writes it back (nothing to write -- it's already there)
+        self.p.run("registry", "--sync")
+        self.assertEqual(front(self.p.readme(a))["notes"], "[[ALS/Experiment Journal]]")
+
+    def test_old_registry_row_without_notes_pads_on_read(self):
+        """A TSV cached before the `notes` column existed has 13 fields; reg_read must pad it
+        instead of choking, and round-trip the rest of the row untouched."""
+        self.p.init()
+        a = self.p.new("base")
+        old_cols = ["id", "date", "kind", "status", "agent", "host", "git_sha",
+                    "based_on", "tags", "metrics", "finding", "wandb", "superseded_by"]
+        row = read_tsv(self.p.tsv)[a]
+        self.p.tsv.write_text("\t".join(old_cols) + "\n" + "\t".join(row.get(c, "") for c in old_cols) + "\n")
+        self.p.run("done", a, "--finding", "works")
+        after = read_tsv(self.p.tsv)[a]
+        self.assertEqual(after["notes"], "")
+        self.assertEqual(after["status"], "done")
+        self.assertEqual(after["finding"], "works")
+
+    def test_done_follow_up_appends_and_dedupes(self):
+        self.p.init()
+        a = self.p.new("base")
+        self.p.run("done", a, "--follow-up", "check X", "--follow-up", "check Y")
+        txt = self.p.readme(a).read_text()
+        self.assertIn("## Follow-ups", txt)
+        self.assertIn("- [ ] check X", txt)
+        self.assertIn("- [ ] check Y", txt)
+        self.assertLess(txt.index("## Follow-ups"), txt.index("- [ ] check X"))
+        # repeating the same call must not duplicate either line
+        self.p.run("done", a, "--follow-up", "check X", "--follow-up", "check Y")
+        txt2 = self.p.readme(a).read_text()
+        self.assertEqual(txt2.count("- [ ] check X"), 1)
+        self.assertEqual(txt2.count("- [ ] check Y"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
