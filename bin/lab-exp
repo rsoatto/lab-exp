@@ -870,6 +870,87 @@ def render(exp_dir: Path, out_dir: Path) -> list:
 
 TEMPLATES = {"training": RUN_TRAINING, "analysis": RUN_ANALYSIS}
 
+# Report skeleton -- the house style for hub reports (docs/reports.md). Tokens __X__ are filled by
+# cmd_report; every placeholder the author must replace carries data-todo, which doctor flags.
+REPORT_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>__TITLE__</title>
+<script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
+<script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+<style>
+ :root { color-scheme: light dark; --bg:#fbfbfa; --fg:#1a1a19; --mut:#6b6b68; --line:#d6d5d1; --panel:#fff; --acc:#2f6fd0; }
+ @media (prefers-color-scheme: dark) { :root { --bg:#16171a; --fg:#e9e9e6; --mut:#9a9a96; --line:#33353a; --panel:#1d1f23; } }
+ * { box-sizing: border-box; }
+ body { margin:0; padding:1.25rem 1rem 3rem; max-width:46rem; margin-inline:auto; background:var(--bg); color:var(--fg);
+        font:15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+ h1 { font-size:1.45rem; line-height:1.25; margin:0 0 .35rem; }
+ h2 { font-size:1.05rem; margin:1.8rem 0 .5rem; }
+ .sub { color:var(--mut); font-size:.85rem; margin:0 0 1.2rem; }
+ .answer { font-size:1.05rem; border-left:3px solid var(--acc); padding:.2rem 0 .2rem .9rem; margin:1rem 0 1.2rem; }
+ .kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(9.5rem, 1fr)); gap:.6rem; margin:1rem 0; }
+ .kpi { background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:.65rem .8rem; }
+ .kpi b { display:block; font-size:1.35rem; font-variant-numeric:tabular-nums; }
+ .kpi span { color:var(--mut); font-size:.8rem; }
+ figure { margin:1.2rem 0; }
+ figure .chart { width:100%; max-width:700px; }
+ figcaption { color:var(--mut); font-size:.85rem; margin-top:.4rem; }
+ img, svg { max-width:100%; height:auto; }
+ .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:9px; }
+ table { border-collapse:collapse; width:100%; font-size:.9rem; font-variant-numeric:tabular-nums; }
+ th, td { padding:.4rem .6rem; text-align:right; border-bottom:1px solid var(--line); white-space:nowrap; }
+ th:first-child, td:first-child { text-align:left; }
+ thead th { background:var(--panel); position:sticky; top:0; }
+ code { font-size:.9em; background:var(--panel); padding:.05rem .3rem; border-radius:4px; }
+ footer { margin-top:2.5rem; padding-top:.8rem; border-top:1px solid var(--line); color:var(--mut); font-size:.8rem; }
+ footer dl { display:grid; grid-template-columns:max-content 1fr; gap:.15rem .8rem; margin:0; }
+ footer dt { color:var(--mut); } footer dd { margin:0; word-break:break-all; }
+ [data-todo] { outline:1px dashed var(--acc); outline-offset:2px; }
+</style></head><body>
+<h1 data-todo="title: the question, or the conclusion">__TITLE__</h1>
+<p class="sub">__ID__ · __DATE__</p>
+
+<p class="answer" data-todo="answer first: the finding, its number, comparison, n">__FINDING__</p>
+
+<div class="kpis">
+__KPIS__
+</div>
+
+<h2 data-todo="heading = the claim this figure supports">What the evidence shows</h2>
+<figure>
+  <div class="chart" id="fig1"></div>
+  <figcaption data-todo="caption: what to look at, and what it shows (with n)">Each point is …; points above the line ….</figcaption>
+</figure>
+<script>
+  // Replace with the real spec. Data goes INSIDE the spec (values), never a fetch.
+  vegaEmbed("#fig1", {
+    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+    "width": "container", "height": 260,
+    "data": {"values": [{"x": "baseline", "y": 0.87}, {"x": "this run", "y": 0.91}]},
+    "mark": "bar",
+    "encoding": {"x": {"field": "x", "type": "nominal", "title": null},
+                 "y": {"field": "y", "type": "quantitative", "title": "AUROC"},
+                 "color": {"field": "x", "type": "nominal", "legend": null, "scale": {"scheme": "tableau10"}}}
+  }, {"actions": false});
+</script>
+
+<h2>Method</h2>
+<p data-todo="what was run; the ONE change vs based_on; the settings the result hinges on">__METHOD__</p>
+
+<h2>Caveats</h2>
+<ul data-todo="what would change the conclusion; what was not controlled"><li>…</li></ul>
+
+<footer><dl>
+  <dt>experiment</dt><dd>__ID__</dd>
+  <dt>git</dt><dd>__SHA__</dd>
+  <dt>command</dt><dd><code>__COMMAND__</code></dd>
+  <dt>run</dt><dd>__RUN__</dd>
+</dl></footer>
+</body></html>
+"""
+
 
 # ---------------------------------------------------------------- init
 
@@ -1945,6 +2026,102 @@ def cmd_hub(a):
     print(f"hub: {len(roots)} project(s) -> {out}")
 
 
+def cmd_report(a):
+    """Write a report skeleton in the house style (docs/reports.md) with provenance filled in."""
+    root = find_root(a.root)
+    d = exp_dir(root, a.id)
+    eid = d.name
+    fm = read_front(d / "README.md")
+    metaj = d / "out" / "run-meta.json"
+    try:
+        rm = json.loads(metaj.read_text()) if metaj.is_file() else {}
+    except ValueError:
+        rm = {}
+    out = d / "out" / (a.out or "report.html")
+    if out.exists() and not a.force:
+        die(f"{out.relative_to(root)} exists -- pass --force to overwrite it")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    metrics = [m.split("=", 1) for m in split_list(fm.get("metrics", "")) if "=" in m]
+    if not metrics:
+        try:
+            mj = json.loads((d / "out" / "metrics.json").read_text())
+            metrics = [(k, v) for k, v in mj.items() if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        except (OSError, ValueError):
+            metrics = []
+    kpis = "\n".join(f'  <div class="kpi" data-todo="value · label · comparison"><b>{_html.escape(str(v))}</b>'
+                     f'<span>{_html.escape(str(k))} · vs …</span></div>' for k, v in metrics[:5]) \
+        or '  <div class="kpi" data-todo="value · label · comparison"><b>0.91</b><span>AUROC · baseline 0.87 · 5 seeds</span></div>'
+    hw = rm.get("hardware", {}) if isinstance(rm.get("hardware"), dict) else {}
+    gpus = hw.get("gpus", []) or []
+    run = " · ".join(x for x in (rm.get("submitted_utc", "")[:16], hw.get("exec_host") or rm.get("host", ""),
+                                  (gpus[0] + (f" ×{len(gpus)}" if len(gpus) > 1 else "")) if gpus else "") if x)
+    based = split_list(fm.get("based_on", ""))
+    page = (REPORT_TEMPLATE
+            .replace("__TITLE__", _html.escape(fm.get("title") or eid))
+            .replace("__ID__", _html.escape(eid))
+            .replace("__DATE__", _html.escape(fm.get("date", "") or str(date.today())))
+            .replace("__FINDING__", _html.escape(fm.get("finding", "") or "The answer to the hypothesis, in one sentence, with its number, comparison and n."))
+            .replace("__KPIS__", kpis)
+            .replace("__METHOD__", _html.escape((f"Based on {', '.join(based)}: " if based else "") + "what this run does, and the one thing it changes."))
+            .replace("__SHA__", _html.escape(fm.get("git_sha") or rm.get("git_sha", "") or "(not stamped)"))
+            .replace("__COMMAND__", _html.escape(rm.get("command", "") or f"lab-exp run {eid}"))
+            .replace("__RUN__", _html.escape(run or "(not run through lab-exp)")))
+    out.write_text(page)
+    print(f"wrote {out.relative_to(root)}  -- replace every data-todo placeholder; style guide: docs/reports.md")
+
+
+REPORT_CAP_MB = 25          # the hub's default --max-mb: above it, the hub shows a pointer page
+_REL_ASSET = re.compile(r"(?:src|href)\s*=\s*[\"']([^\"']+)[\"']", re.I)
+
+
+def report_issues(path):
+    """Mechanical checks from docs/reports.md section 6 for one report file. Returns [str]."""
+    out = []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return out
+    if size > REPORT_CAP_MB * 1048576:
+        out.append(f"{size / 1048576:.0f} MB > {REPORT_CAP_MB} MB hub cap (shows as a pointer page)")
+    if size > 4 * 1048576:
+        return out             # too big to scan cheaply; the size warning already covers it
+    try:
+        txt = path.read_text(errors="replace")
+    except OSError:
+        return out
+    missing = sorted({u for u in _REL_ASSET.findall(txt)
+                      if not u.startswith(("http://", "https://", "//", "data:", "#", "mailto:", "javascript:", "blob:", "?"))
+                      and not u.lower().endswith((".html", ".htm"))})
+    if missing:
+        out.append("references local file(s) the hub does not carry: " + ", ".join(missing[:4])
+                   + (" …" if len(missing) > 4 else "") + " -- inline them (data URI / inline SVG)")
+    low = txt.lower()
+    if "fetch(" in txt or "<iframe" in low:
+        out.append("loads data at open time (fetch/iframe) -- embed it in the page instead")
+    if "data-todo" in txt:
+        out.append("skeleton placeholders (data-todo) still present -- unfinished report")
+    if "<title>" not in low:
+        out.append("no <title>")
+    if 'name="viewport"' not in txt:
+        out.append("no viewport meta (unreadable on a phone)")
+    return out
+
+
+def report_health(root):
+    """[(eid, rel, issue)] over every report the hub would surface."""
+    found = []
+    for d in exp_dirs(root):
+        outd = d / "out"
+        try:
+            reps = sorted(list(outd.glob("*.html")) + list(outd.glob("*/*.html")))[:20]
+        except OSError:
+            continue
+        for q in reps:
+            for issue in report_issues(q):
+                found.append((d.name, q.relative_to(outd).as_posix(), issue))
+    return found
+
+
 def cmd_projects(a):
     if not PROJECTS_TSV.is_file():
         print("(no lab-exp projects registered on this machine)")
@@ -2424,6 +2601,8 @@ def cmd_doctor(a):
                         flag(f"cache/{entry.name}: PROVENANCE names {ids[:2]} but no such experiment here")
     for w in pkg_health(root, cfg):
         flag(w)
+    for eid, rel, issue in report_health(root):
+        flag(f"{eid}: report {rel}: {issue}")
     dead = [r for r in serves_read() if not tmux_alive(r[3])]
     for r in dead:
         print(f"  note dead serve entry pruned: {r[1]} port {r[2]}")
@@ -2555,6 +2734,11 @@ def main():
                    help="a GitHub 'new issue' URL: the DAG pages then let the user queue supersede/important "
                         "marks and submit them as an issue, which `lab-exp intents` applies (via the publisher)")
 
+    s = sub.add_parser("report", help="write a report skeleton in the house style (docs/reports.md) into out/")
+    s.add_argument("id")
+    s.add_argument("--out", default="", metavar="REL", help="path under out/ (default report.html; e.g. viz/ablation.html)")
+    s.add_argument("--force", action="store_true", help="overwrite an existing file")
+
     s = sub.add_parser("intents", help="apply queued hub marks (a 'lab-exp intents v1' document, e.g. an issue body)")
     s.add_argument("file", help="path, or - for stdin")
     s.add_argument("--dry-run", action="store_true")
@@ -2571,7 +2755,7 @@ def main():
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
      "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
-     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents,
+     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents, "report": cmd_report,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
 
 

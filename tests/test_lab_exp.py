@@ -359,5 +359,46 @@ class LabExpTests(unittest.TestCase):
         self.assertEqual(self.p.run("list").stdout, self.p.run("list").stdout)
 
 
+    # ---- reports: skeleton + doctor's mechanical checks ------------------------------------------
+
+    def test_report_skeleton_and_doctor_checks(self):
+        self.p.init()
+        a = self.p.new("base", title="Does X beat Y?")
+        self.p.run("done", a, "--finding", "X beats Y: 0.9 vs 0.8", "--metrics", "acc=0.9")
+        out = self.p.run("report", a).stdout
+        self.assertIn("wrote", out)
+        rp = self.p.root / "experiments" / a / "out" / "report.html"
+        txt = rp.read_text()
+        for needle in ("<title>Does X beat Y?</title>", "X beats Y: 0.9 vs 0.8", "<b>0.9</b>", "acc", a,
+                       'name="viewport"', "prefers-color-scheme", "data-todo"):
+            self.assertIn(needle, txt)
+        r = self.p.run("report", a, check=False)                      # refuses to overwrite
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--force", r.stderr)
+        self.p.run("report", a, "--out", "viz/extra.html")
+        self.assertTrue((self.p.root / "experiments" / a / "out" / "viz" / "extra.html").is_file())
+        # doctor: placeholders left behind are flagged
+        d = self.p.run("doctor", check=False).stdout
+        self.assertIn("skeleton placeholders", d)
+        # a finished, self-contained report is clean
+        rp.write_text('<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+                      '<title>ok</title><script src="https://cdn.jsdelivr.net/npm/vega@5"></script></head>'
+                      '<body><img src="data:image/png;base64,AAAA"><a href="#top">top</a><a href="../other/out/report.html">x</a></body></html>')
+        (self.p.root / "experiments" / a / "out" / "viz" / "extra.html").unlink()
+        d = self.p.run("doctor", check=False).stdout
+        self.assertNotIn("report ", d)
+        # a report leaning on sibling files, fetches, or the size cap is flagged
+        rp.write_text('<!doctype html><html><head><title>t</title></head><body><img src="fig.png">'
+                      '<link rel="stylesheet" href="style.css"><script>fetch("data.json")</script></body></html>')
+        d = self.p.run("doctor", check=False).stdout
+        self.assertIn("fig.png", d)
+        self.assertIn("style.css", d)
+        self.assertIn("fetch/iframe", d)
+        self.assertIn("no viewport meta", d)
+        (self.p.root / "experiments" / a / "out" / "big.html").write_bytes(b"x" * (26 * 1048576))
+        d = self.p.run("doctor", check=False).stdout
+        self.assertIn("26 MB > 25 MB hub cap", d)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 ---
 name: lab-experiments
-description: "How to structure and run experiments in any project managed with `lab-exp` (a `.lab-exp.toml` at the project root marks one). Use whenever you are about to train a model, run an ablation/sweep/analysis, write a plot, or add a method to a research codebase: check the registry and INDEX first, create experiments with `lab-exp new` (never ad-hoc scripts), launch with `lab-exp run` (stamps git SHA/command/hardware for reproducibility; submits via SLURM on the CW cell), record outcomes with `lab-exp done`, mark overridden results with `lab-exp supersede` (never delete; 'mark as superseded/obsolete/defunct/replaced' means this), flag key results with `lab-exp important <id>` (a plain tag the DAG can star and filter to), and visualize through the shared `<pkg>/viz/` layer (`lab-exp viz` / `serve`). Core rules: experiments are APPEND-ONLY; shared code lives in ONE package (promotion ratchet: a second LINEAGE needs it → promote, generalized; within a lineage, load the ancestor's helper); never rewrite a method or visualizer that already exists — grep INDEX.md first. READMEs, findings and reports are written in plain sentences for a reader who was not there (rule 5). Also covers adopting lab-exp in a new/existing project (`lab-exp init`, see migration.md). Claude Code / codex on any lab machine."
+description: "How to structure and run experiments in any project managed with `lab-exp` (a `.lab-exp.toml` at the project root marks one). Use whenever you are about to train a model, run an ablation/sweep/analysis, write a plot, or add a method to a research codebase: check the registry and INDEX first, create experiments with `lab-exp new` (never ad-hoc scripts), launch with `lab-exp run` (stamps git SHA/command/hardware for reproducibility; submits via SLURM on the CW cell), record outcomes with `lab-exp done`, mark overridden results with `lab-exp supersede` (never delete; 'mark as superseded/obsolete/defunct/replaced' means this), flag key results with `lab-exp important <id>` (a plain tag the DAG can star and filter to), and visualize through the shared `<pkg>/viz/` layer (`lab-exp viz` / `serve`). Core rules: experiments are APPEND-ONLY; shared code lives in ONE package (promotion ratchet: a second LINEAGE needs it → promote, generalized; within a lineage, load the ancestor's helper); never rewrite a method or visualizer that already exists — grep INDEX.md first. READMEs, findings and reports are written in plain sentences for a reader who was not there (rule 5). Reports go to experiments/<id>/out/report.html in the house style (reports.md; `lab-exp report <id>` scaffolds one). Also covers adopting lab-exp in a new/existing project (`lab-exp init`, see migration.md). Claude Code / codex on any lab machine."
 ---
 
 # lab-experiments — structured agentic experimentation
@@ -90,8 +90,9 @@ project/
    there is queued in the browser and submitted as a GitHub issue, which the publisher applies
    with `lab-exp intents` on its next run. The hub republishes within a couple of minutes of any
    registry write (`new`, `run`, `done`, `supersede`, `important`), so a finished experiment is on
-   the phone by the time you report it. Build it with the same static-HTML craft (self-contained, Vega-Lite /
-   Plotly / inline SVG, KPI cards, no runtime); tell the user the experiment id, not a URL.
+   the phone by the time you report it. Style guide: [reports.md](reports.md) (answer first, KPI cards, captioned evidence, one
+   self-contained file under 25 MB); `lab-exp report <id>` writes a skeleton that follows it and
+   `doctor` checks the mechanical rules. Tell the user the experiment id, not a URL.
    Reproduce an old experiment at its recorded SHA via `git worktree`.
 5. **Write the README and reports for a reader who was not there.** The README and the
    recorded finding are read far more often than the code, usually by someone who does not have
