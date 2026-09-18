@@ -288,6 +288,10 @@ class LabExpTests(unittest.TestCase):
         txt = (site / "proj" / "index.html").read_text()
         for needle in ('P.get("days")', 'P.get("q")', 'P.get("from")', 'P.get("important")'):
             self.assertIn(needle, txt)
+        # deep links are applied to the state before the first paint (no unfiltered flash), and the
+        # camera is one transform on a world group (no per-frame viewBox rewrite)
+        self.assertLess(txt.index("URLSearchParams"), txt.index("buildDom();"))
+        self.assertIn('el("g", { id: "world" })', txt)
 
     def test_hub_builds_index_dag_and_copies_reports(self):
         self.p.init()

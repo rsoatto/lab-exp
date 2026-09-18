@@ -353,6 +353,7 @@ let FOCUS = null;      // the focused id set as of the last relayout
 const W = 210, H = 62; // node box; layout() owns the gaps
 
 /* ---- persistent DOM: built once, restyled and moved afterwards -------------------------- */
+const world = el("g", { id: "world" });          // pan/zoom is ONE transform on this group
 const gBands = el("g", { class: "bands" }), gEdges = el("g"), gNodes = el("g");
 const NODE_EL = new Map(), EDGE_EL = [];
 function buildDom() {
@@ -381,7 +382,8 @@ function buildDom() {
   gBands.appendChild(el("line", { class: "band-line", id: "band-line" }));
   gBands.appendChild(el("text", { class: "band-label", id: "band-top" }));
   gBands.appendChild(el("text", { class: "band-label", id: "band-bot" }));
-  svg.append(defs, gBands, gEdges, gNodes);
+  world.append(gBands, gEdges, gNodes);
+  svg.append(defs, world);
   svg.setAttribute("width", "100%"); svg.setAttribute("height", "100%");
   refreshNodeStyles();
 }
@@ -415,18 +417,23 @@ function layoutBands(focus) {
     divider: outIds.length && inIds.length ? top.height + BAND_GAP / 2 : null,
   };
 }
-function setDivider(L) {
-  gBands.style.opacity = L.divider === null ? 0 : 1;
-  if (L.divider === null) return;
+function dividerOf(L) {
+  if (L.divider === null) return null;
+  // labels sit at the focused band's left edge, which is what the camera frames
+  return { y: L.divider, lx: L.bot ? L.bot.x0 : 0, x0: -40, x1: L.width + 40, nOut: L.nOut, nIn: L.nIn };
+}
+function placeDivider() {
+  gBands.style.opacity = DIV ? 1 : 0;
+  if (!DIV) return;
   const line = document.getElementById("band-line");
-  line.setAttribute("x1", -40); line.setAttribute("x2", L.width + 40);
-  line.setAttribute("y1", L.divider); line.setAttribute("y2", L.divider);
+  line.setAttribute("x1", DIV.x0); line.setAttribute("x2", DIV.x1);
+  line.setAttribute("y1", DIV.y); line.setAttribute("y2", DIV.y);
   const t = document.getElementById("band-top"), b = document.getElementById("band-bot");
-  const lx = L.bot ? L.bot.x0 : 0;             // labels sit at the focused band's left edge, which the camera frames
-  t.setAttribute("x", lx); t.setAttribute("y", L.divider - 9);
-  t.textContent = `↑ ${L.nOut} greyed out by the current filters`;
-  b.setAttribute("x", lx); b.setAttribute("y", L.divider + 17);
-  b.textContent = `↓ ${L.nIn} shown`;
+  const tgt = TARGET && TARGET.div ? TARGET.div : DIV;    // counts read from the destination
+  t.setAttribute("x", DIV.lx); t.setAttribute("y", DIV.y - 9);
+  t.textContent = `↑ ${tgt.nOut} greyed out by the current filters`;
+  b.setAttribute("x", DIV.lx); b.setAttribute("y", DIV.y + 17);
+  b.textContent = `↓ ${tgt.nIn} shown`;
 }
 
 /* ---- geometry from POS ------------------------------------------------------------------ */
@@ -445,39 +452,61 @@ function placeAll() {
     const a = POS.get(e.parent), b = POS.get(e.child);
     if (a && b) e.el.setAttribute("d", edgePath(a, b));
   }
+  placeDivider();
   apply();
 }
 
-/* ---- animation: positions and camera move together ------------------------------------- */
-let anim = null, TARGET = null;   // TARGET = {pos, view} the current animation is heading to
+/* ---- animation: positions, divider and camera move together ----------------------------- */
+let anim = null, TARGET = null, animGuard = null;   // TARGET = {pos, view, div} the motion is heading to
+let DIV = null, DIV_FROM = null;                    // divider geometry: current, and where it started
 const ease = u => u < .5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
 const MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 560;
-let animGuard = null;
+const lerpDiv = (a, b, e) => (!a || !b) ? b : { y: a.y + (b.y - a.y) * e, lx: a.lx + (b.lx - a.lx) * e,
+                                                 x0: a.x0 + (b.x0 - a.x0) * e, x1: a.x1 + (b.x1 - a.x1) * e };
+// Finish a running motion instantly. Only while one runs: the camera target is stale as soon as
+// the user pans by hand, so restoring it later would yank the view back.
 function snapToTarget() {
-  if (anim) { cancelAnimationFrame(anim); anim = null; }
-  if (TARGET) { POS = new Map(TARGET.pos); view = { ...TARGET.view }; placeAll(); }
+  clearTimeout(animGuard);
+  if (!anim) return;
+  cancelAnimationFrame(anim.raf); anim = null;
+  if (TARGET) { POS = new Map(TARGET.pos); view = { ...TARGET.view }; DIV = TARGET.div; placeAll(); }
 }
 document.addEventListener("visibilitychange", () => { if (document.hidden) snapToTarget(); });
-function animateTo(targetPos, targetView, ms) {
-  if (anim) { cancelAnimationFrame(anim); anim = null; }
+function animateTo(targetPos, targetView, ms, targetDiv) {
+  if (targetDiv === undefined) targetDiv = TARGET ? TARGET.div : DIV;
   clearTimeout(animGuard);
+  // Same layout already in flight, only the camera target changed (a click landed mid-motion):
+  // bend the camera path instead of restarting the whole motion -- a restart re-eases from rest,
+  // which shows as a hitch.
+  if (anim && ms && anim.posTarget === targetPos) {
+    const e = anim.e;
+    if (e < 1) anim.v0 = { k: (view.k - e * targetView.k) / (1 - e), x: (view.x - e * targetView.x) / (1 - e),
+                           y: (view.y - e * targetView.y) / (1 - e) };
+    TARGET = { pos: targetPos, view: targetView, div: targetDiv };
+    animGuard = setTimeout(snapToTarget, anim.ms + 400);
+    return;
+  }
+  if (anim) { cancelAnimationFrame(anim.raf); anim = null; }
   // a relayout that lands mid-animation starts from where things ARE, not where they were going
   const from = new Map(ALL_IDS.map(id => [id, POS.get(id) || targetPos.get(id)]));
-  const v0 = { ...view };
-  TARGET = { pos: targetPos, view: targetView };
-  if (!ms) { POS = new Map(targetPos); view = { ...targetView }; placeAll(); return; }
-  const t0 = performance.now();
+  DIV_FROM = DIV;
+  TARGET = { pos: targetPos, view: targetView, div: targetDiv };
+  if (!ms) { POS = new Map(targetPos); view = { ...targetView }; DIV = targetDiv; placeAll(); return; }
+  const a = anim = { raf: 0, t0: performance.now(), ms, from, v0: { ...view }, posTarget: targetPos, e: 0 };
   const step = now => {
-    const u = Math.min(1, (now - t0) / ms), e = ease(u);
+    if (anim !== a) return;
+    const u = Math.min(1, (now - a.t0) / a.ms), e = a.e = ease(u);
+    const tp = TARGET.pos, tv = TARGET.view;
     for (const id of ALL_IDS) {
-      const a = from.get(id), b = targetPos.get(id);
-      POS.set(id, { x: a.x + (b.x - a.x) * e, y: a.y + (b.y - a.y) * e, w: b.w, h: b.h });
+      const f = a.from.get(id), b = tp.get(id);
+      POS.set(id, { x: f.x + (b.x - f.x) * e, y: f.y + (b.y - f.y) * e, w: b.w, h: b.h });
     }
-    view = { k: v0.k + (targetView.k - v0.k) * e, x: v0.x + (targetView.x - v0.x) * e, y: v0.y + (targetView.y - v0.y) * e };
+    view = { k: a.v0.k + (tv.k - a.v0.k) * e, x: a.v0.x + (tv.x - a.v0.x) * e, y: a.v0.y + (tv.y - a.v0.y) * e };
+    DIV = lerpDiv(DIV_FROM, TARGET.div, e);
     placeAll();
-    if (u < 1) anim = requestAnimationFrame(step); else { anim = null; clearTimeout(animGuard); }
+    if (u < 1) a.raf = requestAnimationFrame(step); else { anim = null; clearTimeout(animGuard); }
   };
-  anim = requestAnimationFrame(step);
+  a.raf = requestAnimationFrame(step);
   animGuard = setTimeout(snapToTarget, ms + 400);   // frames stopped coming (hidden tab, throttling)
 }
 
@@ -499,18 +528,26 @@ function frameFor(x0, y0, x1, y1, pad, maxK) {
               y: tall ? pad / 2 - k * y0 : r.height / 2 - k * (y0 + y1) / 2 };
 }
 function frameBox(x0, y0, x1, y1, pad, maxK) { view = frameFor(x0, y0, x1, y1, pad, maxK); apply(); }
-const apply = () => svg.setAttribute("viewBox",
-  `${-view.x / view.k} ${-view.y / view.k} ${svg.clientWidth / view.k} ${svg.clientHeight / view.k}`);
+// Camera = a transform on the world group. Rewriting the svg viewBox every frame instead made the
+// browser re-lay-out every text label per frame on a 400-node page, which read as flicker.
+const apply = () => world.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
 // Pan (at the current zoom) so a node you navigated to is on screen; a no-op when it already is.
-// Judged against where the layout is HEADING (a click can land mid-animation), and the layout
-// keeps heading there: only the camera target changes.
+// Pan by the SMALLEST amount that brings the node fully on screen (with a margin), at the current
+// zoom; a no-op when it already is. While a relayout is in flight this is judged against where
+// the layout and camera are HEADING, and the motion keeps heading there with a bent camera path;
+// otherwise against the live view, which the user may have panned by hand.
 function ensureVisible(id) {
-  const pos = TARGET ? TARGET.pos : POS, v = TARGET ? TARGET.view : view;
+  const running = !!anim;
+  const pos = running ? TARGET.pos : POS, v = running ? TARGET.view : view;
   const p = pos.get(id); if (!p) return;
-  const r = document.getElementById("graph").getBoundingClientRect();
-  const vx = -v.x / v.k, vy = -v.y / v.k, vw = r.width / v.k, vh = r.height / v.k;
-  if (p.x >= vx && p.x + p.w <= vx + vw && p.y >= vy && p.y + p.h <= vy + vh) return;
-  animateTo(pos, { k: v.k, x: r.width / 2 - v.k * (p.x + p.w / 2), y: r.height / 2 - v.k * (p.y + p.h / 2) }, MOTION);
+  const r = document.getElementById("graph").getBoundingClientRect(), M = 24;
+  const sx0 = v.x + v.k * p.x - M, sy0 = v.y + v.k * p.y - M;            // node box in screen px
+  const sx1 = v.x + v.k * (p.x + p.w) + M, sy1 = v.y + v.k * (p.y + p.h) + M;
+  let dx = 0, dy = 0;
+  if (sx0 < 0) dx = -sx0; else if (sx1 > r.width) dx = r.width - sx1;
+  if (sy0 < 0) dy = -sy0; else if (sy1 > r.height) dy = r.height - sy1;
+  if (!dx && !dy) return;
+  animateTo(pos, { k: v.k, x: v.x + dx, y: v.y + dy }, MOTION);
 }
 
 /* ---- THE entry point after any filter change -------------------------------------------- */
@@ -527,9 +564,8 @@ function refilter(opts = {}) {
                                               : "nothing matches the current filters — everything is greyed above";
   if (changed || opts.force) {
     const L = layoutBands(focus);
-    setDivider(L);
     const b = L.bot || { x0: 0, y0: 0, x1: L.width, y1: L.height };   // frame the focused band, else everything
-    animateTo(L.pos, frameFor(b.x0, b.y0, b.x1, b.y1, 60, 1), opts.instant ? 0 : MOTION);
+    animateTo(L.pos, frameFor(b.x0, b.y0, b.x1, b.y1, 60, 1), opts.instant ? 0 : MOTION, dividerOf(L));
   }
   if (selected) highlight(selected);
 }
@@ -692,6 +728,7 @@ let drag = null, dragged = false;
 const DRAG_SLOP = 4;
 gdiv.addEventListener("pointerdown", e => {
   if (e.button !== 0) return;
+  snapToTarget();                                   // grabbing the graph ends a running motion
   drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, captured: false };
   dragged = false;
 });
@@ -716,6 +753,7 @@ gdiv.addEventListener("pointerup", endDrag);
 gdiv.addEventListener("pointercancel", endDrag);
 gdiv.addEventListener("wheel", e => {
   e.preventDefault();
+  snapToTarget();
   const r = gdiv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
   const f = Math.exp(-e.deltaY * 0.0015), k = Math.min(3, Math.max(0.15, view.k * f));
   view.x = mx - (mx - view.x) * (k / view.k); view.y = my - (my - view.y) * (k / view.k);
@@ -802,35 +840,34 @@ document.getElementById("datepre").addEventListener("change", ev => {
 for (const id of ["datefrom", "dateto"])
   document.getElementById(id).addEventListener("change", () =>
     setDates(document.getElementById("datefrom").value, document.getElementById("dateto").value));
-buildDom();
-refilter({ instant: true });
 /* ---- deep links: ?days=7 | ?from=YYYY-MM-DD&to=YYYY-MM-DD | ?q=<text> | ?important=1 ----------
-   So a note or a digest can link straight to "this week's experiments" or to one experiment.
-   Works behind the hub's lock page too: decryption rewrites the document, not the URL. */
+   So a note or a digest can link straight to "this week's experiments" or to one experiment. Applied
+   to the filter STATE before the first paint, so the page opens already filtered instead of flashing
+   the whole graph and animating away from it. Works behind the hub's lock page too: decryption
+   rewrites the document, not the URL. */
 (() => {
   const P = new URLSearchParams(location.search || location.hash.replace(/^#/, "?"));
-  const days = Number(P.get("days") || 0);
+  const sel = document.getElementById("datepre"), days = Number(P.get("days") || 0);
   if (days > 0) {
     const from = new Date(); from.setDate(from.getDate() - days + 1);
-    const sel = document.getElementById("datepre");
+    dateFrom = isoDay(from); dateTo = "";
     if ([...sel.options].some(o => o.value === String(days))) sel.value = String(days);
     else { sel.value = "custom"; document.getElementById("daterange").style.display = ""; }
-    setDates(isoDay(from), "");
   } else if (P.get("from") || P.get("to")) {
-    const sel = document.getElementById("datepre");
+    dateFrom = P.get("from") || ""; dateTo = P.get("to") || "";
     sel.value = "custom"; document.getElementById("daterange").style.display = "";
-    setDates(P.get("from") || "", P.get("to") || "");
   }
-  if (P.get("important") === "1") {
-    const cb = document.getElementById("imponly");
-    if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event("change")); }
-  }
-  if (P.get("q")) { q.value = P.get("q"); q.dispatchEvent(new Event("input")); }
-  // a deep link should land already filtered: skip the search debounce
-  if (P.get("q")) { clearTimeout(qTimer); const t = q.value.trim().toLowerCase();
+  document.getElementById("datefrom").value = dateFrom;
+  document.getElementById("dateto").value = dateTo;
+  if (P.get("important") === "1") { impOnly = true; document.getElementById("imponly").checked = true; }
+  if (P.get("q")) {
+    q.value = P.get("q");
+    const t = q.value.trim().toLowerCase();
     matched = new Set(NODES.filter(n => [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
-    refilter(); }
+  }
 })();
+buildDom();
+refilter({ instant: true });
 </script>
 </body></html>
 """
