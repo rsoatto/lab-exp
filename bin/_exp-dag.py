@@ -78,6 +78,7 @@ TEMPLATE = r"""<!doctype html>
  @media (max-width: 640px) {
    header { padding:.5rem .8rem; gap:.35rem .7rem; }
    #legend { display:none; }               /* the status colours are on the nodes themselves */
+   #hint { display:none; }                 /* touch has no scroll-to-zoom, and it overlapped the bottom row */
    main { flex-direction:column; }
    #graph { min-height:0; flex:1; }
    aside { width:auto; max-height:40vh; border-left:0; border-top:1px solid var(--line); padding:.9rem 1rem; }
