@@ -160,7 +160,7 @@ TEMPLATE = r"""<!doctype html>
  .node.pick-old rect.box { stroke-dasharray:5 3; stroke-width:2.5px; }
 </style></head><body>
 <header>
-  <h1>__TITLE__</h1><span class="count" id="count"></span>
+  <h1><a id="hubup" href="../" style="color:inherit;text-decoration:none" title="all projects">__TITLE__</a></h1><span class="count" id="count"></span>
   <input type="search" id="q" placeholder="filter by id, tag, kind, finding…">
   <span class="legend" id="datef"><select id="datepre" title="filter by experiment date">
       <option value="">all dates</option><option value="7">last 7 days</option><option value="30">last 30 days</option>
@@ -694,7 +694,7 @@ async function doSupersede(oldId, byId_) {
   if (why === null) { setPicking(null); return; }        // Cancel aborts
   setPicking(null);
   if (!LIVE) { queueIntent("supersede", oldId, { by: byId_, why }); afterMark(oldId); return; }
-  const res = await api("/supersede", { old: oldId, by: byId_, why });
+  const res = await api("supersede", { old: oldId, by: byId_, why });
   if (res) applyLocal(oldId, "superseded", res.by || "");
 }
 function nodeClick(id) {
@@ -725,7 +725,7 @@ function select(id) {
           ? `<button id="btn-undo">undo supersede</button>`
           : `<button id="btn-sup">mark superseded…</button>`}<button id="btn-imp">${isImp(id) ? "☆ unmark important" : "★ mark important"}</button></div>` : ""}
     ${(n.reports || []).length ? `<div class="actions" style="flex-wrap:wrap">${n.reports.map(rp =>
-        `<a href="${LIVE ? "/report/" + esc(id) + "/" + esc(rp) : esc(n.dir) + "/out/" + esc(rp)}"
+        `<a href="${LIVE ? "report/" + esc(id) + "/" + esc(rp) : esc(n.dir) + "/out/" + esc(rp)}"
             target="_blank" style="font-size:.85rem">▤ ${esc(rp.replace(/\.html$/, ""))}</a>`).join("")}</div>` : ""}
     ${n.finding ? `<p style="font-size:.9rem">${esc(n.finding)}</p>` : ""}
     <div class="chips">${tagsOf(n).map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div>
@@ -741,12 +741,12 @@ function select(id) {
   on("btn-nosucc", () => doSupersede(id, ""));
   on("btn-undo",   async () => {
     if (!LIVE) { queueIntent("unsupersede", id); afterMark(id); return; }
-    if (await api("/undo", { id })) applyLocal(id, "done", "");
+    if (await api("undo", { id })) applyLocal(id, "done", "");
   });
   wireNotes(id);
   on("btn-imp",    async () => {
     if (!LIVE) { queueIntent(isImp(id) ? "unimportant" : "important", id); afterMark(id); return; }
-    const res = await api("/important", { id, on: !isImp(id) });
+    const res = await api("important", { id, on: !isImp(id) });
     if (!res) return;
     byId.get(id).tags = res.tags;      // server returns the canonical string -- no client surgery
     refreshImp(); refreshNodeStyles(); refilter({ force: true }); select(id);
@@ -773,7 +773,7 @@ function notesHtml(id, n) {
 async function submitNote(id, text, replace) {
   const author = "Renzo";
   if (!LIVE) { queueIntent("note", id, { at: replace || noteStamp(), replace, text, author }); noteEdit = null; afterMark(id); return; }
-  const res = await api("/note", { id, text, replace, author, at: noteStamp() });
+  const res = await api("note", { id, text, replace, author, at: noteStamp() });
   if (!res) return;
   byId.get(id).readme = res.readme;
   noteEdit = null; select(id);
@@ -989,6 +989,17 @@ for (const id of ["datefrom", "dateto"])
 })();
 buildDom();
 refilter({ instant: true });
+if (LIVE) {
+  // A live page is a window onto the registry: coming back to the tab after a while shows what
+  // landed meanwhile (the boxes keep recording). Fresh tabs (under a minute) are left alone.
+  let hiddenAt = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (hiddenAt && Date.now() - hiddenAt > 60000 && !PENDING.length && !picking) location.reload();
+  });
+  hint.textContent = "live · marks and notes are written immediately · reload for the latest";
+}
+if (location.pathname === "/") { const up = document.getElementById("hubup"); if (up) up.removeAttribute("href"); }   // one-project page: no hub above it
 </script>
 </body></html>
 """

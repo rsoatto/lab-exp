@@ -3,6 +3,7 @@
 Each test builds a throwaway project (with its own git repo and HOME) and drives the real CLI
 via subprocess, so what is tested is exactly what an agent runs."""
 import json
+import urllib.error
 import os
 import re
 import shutil
@@ -363,6 +364,52 @@ class LabExpTests(unittest.TestCase):
         txt = (site / "proj" / "index.html").read_text()
         for needle in ("function notesSplit", "function noteUpsertText", 'id="note-text"', "note-save", "--b64", "hello note"):
             self.assertIn(needle, txt)
+
+    # ---- live hub: index + per-project DAG + reports + writes, in one process -------------------
+
+    def test_live_hub_serves_index_dag_reports_and_writes(self):
+        import importlib.machinery
+        import importlib.util
+        import threading
+        import urllib.request
+        self.p.init()
+        a = self.p.new("base")
+        (self.p.root / "experiments" / a / "out" / "report.html").write_text("<p>live report</p>")
+        self.p.run("done", a, "--finding", "it works: 1 vs 0")
+        spec = importlib.util.spec_from_loader("labexp_live", importlib.machinery.SourceFileLoader("labexp_live", str(LAB_EXP)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True); t.start()
+        try:
+            def get(path):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as r:
+                    return r.status, r.read().decode()
+            def post(path, body):
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req) as r:
+                    return json.loads(r.read().decode())
+            self.assertEqual(get("/healthz")[0], 200)
+            code, idx = get("/")
+            self.assertIn('href="proj/"', idx)                       # the project card links into the live DAG
+            self.assertIn("it works: 1 vs 0", idx)
+            self.assertIn("live:", idx)
+            code, dag = get("/proj/")
+            self.assertIn("const LIVE = true", dag)
+            self.assertIn(a, dag)
+            self.assertEqual(get("/proj/report/" + a + "/report.html")[1], "<p>live report</p>")
+            res = post("/proj/note", {"id": a, "text": "from the live hub", "author": "Renzo", "at": "2026-09-21T12:00Z"})
+            self.assertTrue(res["ok"])
+            self.assertIn("- **2026-09-21T12:00Z** (Renzo): from the live hub", self.p.readme(a).read_text())
+            res = post("/proj/important", {"id": a, "on": True})
+            self.assertIn("important", res["tags"])
+            self.assertIn("from the live hub", get("/proj/")[1])    # the next load already shows the write
+            with self.assertRaises(urllib.error.HTTPError):
+                get("/nope/")
+        finally:
+            srv.shutdown(); srv.server_close()
 
     # ---- intents: marks queued on the hub, applied on a box -------------------------------------
 

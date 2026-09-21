@@ -1697,27 +1697,54 @@ def print_tunnel_hint(port):
     print(f"  from your laptop:  ssh -L {port}:localhost:{port} {host}   ->   http://localhost:{port}")
 
 
-def dag_serve(root, port):
-    """Serve the DAG live: every GET re-renders from the registry, and the page's supersede/undo
-    buttons POST back here — click-to-supersede with the same locked writes as the CLI."""
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    if not port:
-        port = ephemeral_port()
+def hub_slug(name):
+    return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "project"
+
+
+def make_live_handler(slugmap, index_html=None):
+    """The request handler behind both live servers. `slugmap` maps a URL prefix to a project
+    root: {"": root} serves one project at /, {slug: root, ...} serves a hub at / with each
+    project under /<slug>/. Every GET re-renders from the registry; the page's buttons POST back
+    to <prefix>/{supersede,undo,important,note} with the same locked writes as the CLI."""
+    from http.server import BaseHTTPRequestHandler
+    from urllib.parse import unquote
+
+    def resolve(path):
+        """(root, prefix, rest): the project a path addresses and the path inside it."""
+        path = unquote(path.split("?", 1)[0])
+        if "" in slugmap:
+            return slugmap[""], "", path
+        seg, _, rest = path.lstrip("/").partition("/")
+        if seg in slugmap:
+            return slugmap[seg], seg, "/" + rest
+        return None, seg, path
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
-        def _send(self, code, body, ctype):
-            b = body.encode()
+        def _send(self, code, body, ctype, extra=None):
+            b = body.encode() if isinstance(body, str) else body
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(b)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(b)
 
         def do_GET(self):
-            if self.path.startswith("/report/"):
+            if self.path.split("?", 1)[0] == "/healthz":
+                self._send(200, "ok", "text/plain"); return
+            root, prefix, rest = resolve(self.path)
+            if root is None:
+                if self.path.split("?", 1)[0] == "/" and index_html is not None:
+                    self._send(200, index_html(), "text/html; charset=utf-8"); return
+                self._send(404, "no such project", "text/plain"); return
+            if prefix and not self.path.split("?", 1)[0].startswith("/" + prefix + "/"):
+                # /<slug> -> /<slug>/ so the page's relative api and report links resolve inside it
+                self._send(301, "", "text/plain", {"Location": "/" + prefix + "/" + (("?" + self.path.split("?", 1)[1]) if "?" in self.path else "")}); return
+            if rest.startswith("/report/"):
                 # /report/<eid>/<relpath under out/>. Both segments come off the wire: the eid
                 # resolves through exp_dir (validates existence); the relpath is confined
                 # LEXICALLY (no .. segments, not absolute, .html only). Deliberately NOT a
@@ -1726,8 +1753,7 @@ def dag_serve(root, port):
                 # -> /ewsc), and those are exactly what this route exists to serve. The server
                 # is the owner's localhost tool; symlinks inside out/ are the owner's.
                 try:
-                    from urllib.parse import unquote
-                    eid, _, rel = unquote(self.path[len("/report/"):]).partition("/")
+                    eid, _, rel = rest[len("/report/"):].partition("/")
                     if not rel or rel.startswith("/") or ".." in rel.split("/"):
                         raise ValueError("bad path")
                     f = exp_dir(root, eid) / "out" / rel
@@ -1740,24 +1766,27 @@ def dag_serve(root, port):
             self._send(200, dag_html(root, live=True), "text/html; charset=utf-8")
 
         def do_POST(self):
+            root, prefix, rest = resolve(self.path)
             n = int(self.headers.get("Content-Length", 0))
             try:
+                if root is None:
+                    raise ValueError("no such project")
                 req = json.loads(self.rfile.read(n) or b"{}")
-                if self.path == "/supersede":
+                if rest == "/supersede":
                     succ = do_supersede(root, req["old"], req.get("by", ""), req.get("why", ""))
                     out = {"ok": True, "old": req["old"], "by": succ}
-                elif self.path == "/undo":
+                elif rest == "/undo":
                     do_unsupersede(root, req["id"])
                     out = {"ok": True, "id": req["id"]}
-                elif self.path == "/important":
+                elif rest == "/important":
                     tags = do_set_important(root, req["id"], bool(req.get("on")))
                     out = {"ok": True, "id": req["id"], "on": bool(req.get("on")), "tags": tags}
-                elif self.path == "/note":
+                elif rest == "/note":
                     txt = note_upsert(exp_dir(root, req["id"]) / "README.md", req.get("at") or note_stamp(),
                                       req.get("text", ""), req.get("author", ""), req.get("replace", ""))
                     out = {"ok": True, "id": req["id"], "readme": txt}
                 else:
-                    raise ValueError(f"unknown endpoint {self.path}")
+                    raise ValueError(f"unknown endpoint {rest}")
             # SystemExit included: exp_dir() die()s on an unknown id, and that must fail the
             # REQUEST, not the server.
             except (Exception, SystemExit) as e:
@@ -1765,11 +1794,43 @@ def dag_serve(root, port):
                 return
             self._send(200, json.dumps(out), "application/json")
 
+    return H
+
+
+def dag_serve(root, port):
+    """Serve ONE project's DAG live (the page's supersede/undo/important/note buttons write
+    through this server with the same locked writes as the CLI)."""
+    from http.server import ThreadingHTTPServer
+    if not port:
+        port = ephemeral_port()
     print(f"serving live DAG on {socket.gethostname().split('.')[0]}:{port}  (Ctrl-C stops; every reload re-reads the registry)")
     print(f"  local:             http://localhost:{port}")
     print_tunnel_hint(port)
     try:
-        HTTPServer(("", port), H).serve_forever()
+        ThreadingHTTPServer(("", port), make_live_handler({"": root})).serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+def hub_serve(roots, port, bind="127.0.0.1", block=True):
+    """The LIVE hub: one process serving every project on this machine -- the index at /, each
+    project's DAG at /<slug>/ (re-read on every load), its reports, and the write endpoints. This
+    is the laptop's write surface (reached through an ssh tunnel); the published static hub is the
+    read-only phone view. Binds to localhost by default because it writes to the repos: only a
+    tunnel or a local browser should reach it. With block=False returns the server (tests)."""
+    from http.server import ThreadingHTTPServer
+    slugmap = {}
+    for root in roots:
+        slugmap[hub_slug(load_cfg(root)["project"].get("name") or root.name)] = root
+    srv = ThreadingHTTPServer((bind, port or 0), make_live_handler(slugmap, lambda: hub_index_html(roots, live=True)))
+    if not block:
+        return srv
+    port = srv.server_address[1]
+    print(f"serving live hub on {socket.gethostname().split('.')[0]}:{port}  ({len(roots)} project(s); Ctrl-C stops)")
+    print(f"  local:             http://localhost:{port}/")
+    print_tunnel_hint(port)
+    try:
+        srv.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
 
@@ -2118,32 +2179,23 @@ def hub_card_links(links):
     return "".join(out)
 
 
-def cmd_hub(a):
-    """A STATIC multi-project site: an index of every lab-exp project registered on this machine,
-    one DAG page per project, and every experiment report (out/*.html, one subdir deep) copied
-    beside it so the DAG's report links work. Hand the directory to a publisher (the lab's
-    `lab-exp-hub` wraps lab-report) and the whole lab is one phone-openable URL.
-
-      lab-exp hub --out DIR [--max-mb 25] [--projects ROOT,ROOT...]
-    """
-    out = Path(a.out).resolve()
-    cap = float(a.max_mb) * 1024 * 1024
-    roots = sorted({Path(r).resolve() for r in split_list(a.projects)}) if a.projects else project_roots()
-    if not roots:
-        die("no lab-exp projects found (none registered in " + str(PROJECTS_TSV) + ", or pass --projects)")
-    out.mkdir(parents=True, exist_ok=True)
+def hub_index_html(roots, live=False, out=None, cap=None, intents="", quiet=False):
+    """The hub index page for `roots`. Static build (out given): also writes each project's DAG
+    page and copies its reports (over `cap` bytes -> a pointer page) under out/<slug>/. Live: only
+    counts, nothing written; cards link to /<slug>/ which the live server renders on demand."""
     cards, week = [], (date.today() - timedelta(days=7)).isoformat()
     for root in roots:
         cfg = load_cfg(root)
         name = cfg["project"].get("name") or root.name
-        slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "project"
-        pdir = out / slug
-        if pdir.exists():
-            shutil.rmtree(pdir)
-        pdir.mkdir(parents=True)
-        (pdir / "index.html").write_text(dag_html(root, intents=a.intents))
+        slug = hub_slug(name)
         rows = reg_read(root)
         n_rep, n_big = 0, 0
+        pdir = (out / slug) if out else None
+        if pdir:
+            if pdir.exists():
+                shutil.rmtree(pdir)
+            pdir.mkdir(parents=True)
+            (pdir / "index.html").write_text(dag_html(root, intents=intents))
         for r in rows:
             outd = root / "experiments" / r["id"] / "out"
             try:
@@ -2151,15 +2203,18 @@ def cmd_hub(a):
             except OSError:
                 reps = []
             for q in reps[:20]:
+                if not pdir:
+                    n_rep += 1
+                    continue
                 dst = pdir / "experiments" / r["id"] / "out" / q.relative_to(outd)
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     size = q.stat().st_size
-                    if size > cap:
+                    if cap is not None and size > cap:
                         n_big += 1
                         dst.write_text(f"<!doctype html><meta charset='utf-8'><title>{r['id']}</title>"
                                        f"<p style='font:15px system-ui;padding:20px'>This report is "
-                                       f"{size / 1048576:.0f} MB, above the hub's {a.max_mb} MB cap. Open it on "
+                                       f"{size / 1048576:.0f} MB, above the hub's {cap / 1048576:.0f} MB cap. Open it on "
                                        f"{socket.gethostname().split('.')[0]}: <code>{q}</code></p>")
                     else:
                         shutil.copyfile(q, dst)
@@ -2185,10 +2240,35 @@ def cmd_hub(a):
         cards.append(f'<div class="cardwrap">{card_a}'
                      + (f'<div class="links">{link_anchors}</div>' if link_anchors else "")
                      + "</div>")
-        print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
-    (out / "index.html").write_text(HUB_INDEX.replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
-                                    .replace("{when}", datetime.now().strftime("%Y-%m-%d %H:%M"))
-                                    .replace("{cards}", "".join(cards)))
+        if not quiet:
+            print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
+    sub = ("live: every page re-reads the registry, and marks and notes are written the moment you make them"
+           if live else f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    return (HUB_INDEX.replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
+            .replace("{when}", sub).replace("{cards}", "".join(cards)))
+
+
+def cmd_hub(a):
+    """A multi-project hub of every lab-exp project registered on this machine.
+
+      lab-exp hub --out DIR [--max-mb 25] [--projects ROOT,...] [--intents URL]
+          STATIC site: index + one DAG page per project + its reports copied beside it, ready for
+          a publisher (the lab's `lab-exp-hub` wraps lab-report) -- the read-only phone view.
+      lab-exp hub --serve [--port N] [--bind 127.0.0.1] [--projects ROOT,...]
+          LIVE server: the same index and DAG pages re-rendered on every load, reports served from
+          the projects, and the pages' supersede / important / note buttons writing straight
+          through -- reach it from a laptop over an ssh tunnel.
+    """
+    roots = sorted({Path(r).resolve() for r in split_list(a.projects)}) if a.projects else project_roots()
+    if not roots:
+        die("no lab-exp projects found (none registered in " + str(PROJECTS_TSV) + ", or pass --projects)")
+    if a.serve:
+        return hub_serve(roots, a.port, a.bind)
+    if not a.out:
+        die("--out DIR (static site) or --serve (live server) is required")
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "index.html").write_text(hub_index_html(roots, live=False, out=out, cap=float(a.max_mb) * 1024 * 1024, intents=a.intents))
     print(f"hub: {len(roots)} project(s) -> {out}")
 
 
@@ -2916,8 +2996,11 @@ def main():
     s.add_argument("--sync", action="store_true", help="write cached facts into READMEs that lack them (additive)")
     s.add_argument("--dry-run", action="store_true", help="report only; write nothing")
 
-    s = sub.add_parser("hub", help="static site of EVERY project on this machine: index + DAG per project + its reports")
-    s.add_argument("--out", required=True, help="output directory (rebuilt per project)")
+    s = sub.add_parser("hub", help="every project on this machine as one site: static (--out DIR, the phone view) or live (--serve)")
+    s.add_argument("--out", default="", help="output directory for the static site (rebuilt per project)")
+    s.add_argument("--serve", action="store_true", help="serve the hub live instead (writes go straight through)")
+    s.add_argument("--port", type=int, default=0, help="port for --serve (default: ephemeral)")
+    s.add_argument("--bind", default="127.0.0.1", help="interface for --serve (default localhost: reach it over an ssh tunnel)")
     s.add_argument("--max-mb", default=25, help="reports above this size become a pointer page (default 25)")
     s.add_argument("--projects", help="comma-separated project roots (default: every registered project)")
     s.add_argument("--intents", default="", metavar="URL",
