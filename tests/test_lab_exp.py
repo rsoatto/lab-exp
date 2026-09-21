@@ -318,6 +318,52 @@ class LabExpTests(unittest.TestCase):
         self.assertIn("report.html", txt)
 
 
+    # ---- notes: dated entries in the README, from the CLI, the hub's queue, or the live server ----
+
+    def test_notes_add_edit_delete_via_cli_and_intents(self):
+        import base64
+        self.p.init()
+        a = self.p.new("base")
+        out = self.p.run("note", a, "--text", "first thought", "--author", "Renzo", "--at", "2026-09-21T10:00Z").stdout
+        self.assertIn("note added (2026-09-21T10:00Z)", out)
+        txt = self.p.readme(a).read_text()
+        self.assertIn("## Notes\n- **2026-09-21T10:00Z** (Renzo): first thought\n", txt)
+        # a second note (multi-line) appends; the first stays
+        self.p.run("note", a, "--text", "line one\nline two", "--at", "2026-09-21T11:00Z")
+        txt = self.p.readme(a).read_text()
+        self.assertIn("- **2026-09-21T11:00Z**: line one\n  line two\n", txt)
+        self.assertEqual(txt.count("- **2026-09-21T"), 2)
+        self.assertIn("first thought", self.p.run("note", a, "--list").stdout)
+        # edit by stamp, through the hub's queued-marks document (text base64 so quotes survive)
+        b = base64.b64encode('edited "quoted" text'.encode()).decode()
+        doc = self.p.tmp / "intents.txt"
+        doc.write_text(f"lab-exp intents v1\nproject: proj\nnote {a} --at 2026-09-21T10:00Z --replace 2026-09-21T10:00Z --author Renzo --b64 {b}\n")
+        out = self.p.run("intents", str(doc)).stdout
+        self.assertIn("note edited", out)
+        txt = self.p.readme(a).read_text()
+        self.assertIn('- **2026-09-21T10:00Z** (Renzo): edited "quoted" text\n', txt)
+        self.assertNotIn("first thought", txt)
+        # delete = empty text with --replace; the section disappears with its last note
+        self.p.run("note", a, "--replace", "2026-09-21T10:00Z", "--text", "")
+        self.p.run("note", a, "--replace", "2026-09-21T11:00Z", "--text", "")
+        txt = self.p.readme(a).read_text()
+        self.assertNotIn("## Notes", txt)
+        self.assertNotIn("line one", txt)
+        # the rest of the README is untouched by all of that
+        self.assertIn("## Hypothesis", txt)
+        r = self.p.run("note", a, "--replace", "2026-01-01T00:00Z", "--text", "x", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_dag_page_has_notes_ui(self):
+        self.p.init()
+        a = self.p.new("base")
+        self.p.run("note", a, "--text", "hello note", "--at", "2026-09-21T10:00Z")
+        site = self.p.tmp / "site_notes"
+        self.p.run("hub", "--out", str(site))
+        txt = (site / "proj" / "index.html").read_text()
+        for needle in ("function notesSplit", "function noteUpsertText", 'id="note-text"', "note-save", "--b64", "hello note"):
+            self.assertIn(needle, txt)
+
     # ---- intents: marks queued on the hub, applied on a box -------------------------------------
 
     def test_intents_apply_and_exit_codes(self):

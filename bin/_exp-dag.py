@@ -94,6 +94,17 @@ TEMPLATE = r"""<!doctype html>
  .kv dd { margin:0; overflow-wrap:anywhere; }
  .rel a { display:block; font-size:.85rem; text-decoration:none; color:inherit; padding:.12rem 0; }
  .rel a:hover { text-decoration:underline; }
+ .notes { border-top:1px solid var(--line); padding-top:.7rem; margin-bottom:.9rem; }
+ .note { border-left:2px solid var(--line); padding:.25rem .6rem; margin:.35rem 0; font-size:.88rem; }
+ .note .stamp { color:var(--mut); font-size:.78rem; display:flex; gap:.6rem; align-items:baseline; }
+ .note .stamp a { margin-left:auto; color:var(--mut); text-decoration:none; font-size:.78rem; }
+ .note .stamp a:hover { color:var(--fg); }
+ .note .body { white-space:pre-wrap; overflow-wrap:anywhere; }
+ .note.queued { border-left-color:var(--running); }
+ .noteform textarea { width:100%; min-height:3.6rem; font:inherit; font-size:.88rem; padding:.4rem .5rem;
+   border:1px solid var(--line); border-radius:7px; background:var(--bg); color:inherit; resize:vertical; }
+ .noteform .row { display:flex; gap:.5rem; align-items:center; margin-top:.35rem; }
+ .noteform .row .meta { margin:0; }
  .md { border-top:1px solid var(--line); padding-top:.9rem; }
  .md h1,.md h2,.md h3 { font-size:.98rem; margin:1.1rem 0 .35rem; }
  .md h1:first-child,.md h2:first-child { margin-top:0; }
@@ -278,6 +289,51 @@ const inDate = id => {
   return !!d && (!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo);
 };
 
+/* ---- README notes: the same grammar lab-exp's note_upsert() writes ----------------------- */
+// `## Notes` holds `- **<ts>** (<author>): <text>` items, continuation lines indented by two
+// spaces; the stamp is the note's identity. The page edits n.readme in memory with the same
+// rules so a queued note shows immediately and reads back identically once the box applies it.
+const NOTE_LINE = /^- \*\*(\S+)\*\*(?: \(([^)]*)\))?: ?(.*)$/;
+function notesSplit(txt) {
+  const m = /^## Notes[ \t]*\n/m.exec(txt || "");
+  if (!m) return { before: txt || "", entries: [], after: "" };
+  const start = m.index + m[0].length, rest = txt.slice(start);
+  const m2 = /^#{1,2} /m.exec(rest);
+  const end = start + (m2 ? m2.index : rest.length);
+  const entries = [];
+  for (const line of txt.slice(start, end).split("\n")) {
+    const mm = NOTE_LINE.exec(line);
+    if (mm) entries.push({ ts: mm[1], author: mm[2] || "", text: mm[3] });
+    else if (line.startsWith("  ") && entries.length) entries[entries.length - 1].text += "\n" + line.slice(2);
+  }
+  return { before: txt.slice(0, m.index), entries, after: txt.slice(end) };
+}
+function notesRender(entries) {
+  const lines = ["## Notes"];
+  for (const e of entries) {
+    const [first, ...rest] = (e.text || "").split("\n");
+    lines.push(`- **${e.ts}**` + (e.author ? ` (${e.author})` : "") + `: ${first}`);
+    for (const r of rest) lines.push("  " + r);
+  }
+  return lines.join("\n") + "\n";
+}
+function noteUpsertText(txt, ts, text, author, replace) {
+  const { before, entries, after } = notesSplit(txt || "");
+  text = (text || "").trim();
+  if (replace) {
+    const i = entries.findIndex(e => e.ts === replace);
+    if (i < 0) return txt;
+    if (text) { entries[i].text = text; if (author) entries[i].author = author; } else entries.splice(i, 1);
+  } else {
+    if (!text) return txt;
+    entries.push({ ts, author, text });
+  }
+  const section = entries.length ? notesRender(entries) : "";
+  return /^## Notes[ \t]*\n/m.test(txt || "") ? before + section + after : (txt || "").replace(/\n+$/, "") + "\n\n" + section;
+}
+const stripNotes = txt => { const { before, after } = notesSplit(txt || ""); return before + after; };
+const noteStamp = () => new Date().toISOString().slice(0, 16) + "Z";
+
 /* ---- queued marks (static pages with INTENTS) ------------------------------------------- */
 // The view applies a mark immediately; the boxes apply it later. Reconciled on every load: a mark
 // the published data already carries is dropped from the queue.
@@ -285,7 +341,8 @@ const IKEY = "labexp-intents:" + (DATA.project || "");
 const OPP = { supersede: "unsupersede", unsupersede: "supersede", important: "unimportant", unimportant: "important" };
 let PENDING = [];
 try { PENDING = JSON.parse(localStorage.getItem(IKEY) || "[]"); } catch (e) { PENDING = []; }
-const snapshot = (n, op) => op === "important" || op === "unimportant"
+const snapshot = (n, op) => op === "note" ? { readme: n.readme || "" }
+  : op === "important" || op === "unimportant"
   ? { tags: n.tags || "" } : { status: n.status, superseded_by: n.superseded_by || "" };
 function applyIntent(it) {
   const n = byId.get(it.id); if (!n) return;
@@ -295,6 +352,7 @@ function applyIntent(it) {
     const t = tagsOf(n).filter(x => x !== "important"); if (it.op === "important") t.push("important");
     n.tags = t.join(",");
   }
+  if (it.op === "note") n.readme = noteUpsertText(n.readme, it.at, it.text, it.author || "", it.replace || "");
 }
 function revertIntent(it) {
   const n = byId.get(it.id); if (!n || !it.prev) return;
@@ -307,6 +365,10 @@ function reflected(it) {
   if (it.op === "unsupersede") return n.status !== "superseded";
   if (it.op === "important")   return isImp(it.id);
   if (it.op === "unimportant") return !isImp(it.id);
+  if (it.op === "note") {
+    const e = notesSplit(n.readme || "").entries.find(x => x.ts === (it.replace || it.at));
+    return it.text.trim() ? !!e && e.text === it.text.trim() : !e;   // published with this text (or gone, for a deletion)
+  }
   return true;
 }
 PENDING = PENDING.filter(it => !reflected(it));
@@ -314,7 +376,10 @@ PENDING.forEach(it => { it.prev = snapshot(byId.get(it.id), it.op); applyIntent(
 function savePending() { try { localStorage.setItem(IKEY, JSON.stringify(PENDING)); } catch (e) {} refreshIntents(); }
 function queueIntent(op, id, extra) {
   const n = byId.get(id);
-  const same = PENDING.filter(p => p.id === id && (p.op === op || p.op === OPP[op]));
+  // notes: any number per node; a second edit of the SAME note (same stamp) replaces the queued one
+  const same = op === "note"
+    ? PENDING.filter(p => p.op === "note" && p.id === id && (p.replace || p.at) === (extra.replace || extra.at))
+    : PENDING.filter(p => p.id === id && (p.op === op || p.op === OPP[op]));
   same.forEach(revertIntent);                              // at most one queued mark per family per node
   PENDING = PENDING.filter(p => !same.includes(p));
   if (!same.some(p => p.op === OPP[op])) {                 // the opposite of a queued mark just drops it
@@ -324,8 +389,12 @@ function queueIntent(op, id, extra) {
   savePending();
 }
 const shq = s => '"' + String(s).replace(/[\r\n]+/g, " ").replace(/["\\]/g, "'") + '"';
+const b64 = s => btoa(unescape(encodeURIComponent(s)));
 const intentLines = () => PENDING.map(it => it.op === "supersede"
   ? `supersede ${it.id}` + (it.by ? ` --by ${it.by}` : "") + (it.why ? ` --why ${shq(it.why)}` : "")
+  : it.op === "note"
+  ? `note ${it.id} --at ${it.at}` + (it.replace ? ` --replace ${it.replace}` : "") + (it.author ? ` --author ${shq(it.author)}` : "")
+    + ` --b64 ${b64(it.text)}`
   : `${it.op} ${it.id}`);
 function refreshIntents() {
   const bar = document.getElementById("intents"); if (!bar) return;
@@ -662,7 +731,8 @@ function select(id) {
     <div class="chips">${tagsOf(n).map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div>
     <dl class="kv">${kv}</dl>
     ${rel(parents.get(id), "parents")}${rel(children.get(id), "children")}
-    <div class="md">${n.readme ? md(n.readme) : "<p class='meta'>(no README.md)</p>"}</div>`;
+    ${notesHtml(id, n)}
+    <div class="md">${n.readme ? md(stripNotes(n.readme)) : "<p class='meta'>(no README.md)</p>"}</div>`;
   side.querySelectorAll("[data-go]").forEach(a =>
     a.addEventListener("click", ev => { ev.preventDefault(); select(a.dataset.go); }));
   const on = (bid, fn) => { const b = document.getElementById(bid); if (b) b.addEventListener("click", fn); };
@@ -673,6 +743,7 @@ function select(id) {
     if (!LIVE) { queueIntent("unsupersede", id); afterMark(id); return; }
     if (await api("/undo", { id })) applyLocal(id, "done", "");
   });
+  wireNotes(id);
   on("btn-imp",    async () => {
     if (!LIVE) { queueIntent(isImp(id) ? "unimportant" : "important", id); afterMark(id); return; }
     const res = await api("/important", { id, on: !isImp(id) });
@@ -681,6 +752,53 @@ function select(id) {
     refreshImp(); refreshNodeStyles(); refilter({ force: true }); select(id);
   });
   side.scrollTop = 0;
+}
+
+/* ---- notes UI: read anywhere, write where marks are possible ---------------------------- */
+let noteEdit = null;      // { id, ts } while editing an existing note
+function notesHtml(id, n) {
+  const entries = notesSplit(n.readme || "").entries;
+  const queued = new Set(PENDING.filter(p => p.op === "note" && p.id === id).map(p => p.replace || p.at));
+  const rows = entries.map(e => `<div class="note${queued.has(e.ts) ? " queued" : ""}" data-ts="${esc(e.ts)}">
+      <div class="stamp"><span>${esc(e.ts)}${e.author ? " · " + esc(e.author) : ""}${queued.has(e.ts) ? " · queued" : ""}</span>
+        ${CAN_MARK ? `<a href="#" data-note-edit="${esc(e.ts)}">edit</a><a href="#" data-note-del="${esc(e.ts)}">delete</a>` : ""}</div>
+      <div class="body">${esc(e.text)}</div></div>`).join("");
+  if (!entries.length && !CAN_MARK) return "";
+  const editing = noteEdit && noteEdit.id === id ? noteEdit.ts : "";
+  const form = CAN_MARK ? `<div class="noteform"><textarea id="note-text" placeholder="add a note about this experiment…"></textarea>
+      <div class="row"><button id="note-save">${editing ? "save edit" : "add note"}</button>
+        ${editing ? `<button id="note-cancel">cancel</button><span class="meta">editing ${esc(editing)}</span>` : ""}</div></div>` : "";
+  return `<div class="notes"><div class="meta">notes${entries.length ? ` (${entries.length})` : ""}</div>${rows}${form}</div>`;
+}
+async function submitNote(id, text, replace) {
+  const author = "Renzo";
+  if (!LIVE) { queueIntent("note", id, { at: replace || noteStamp(), replace, text, author }); noteEdit = null; afterMark(id); return; }
+  const res = await api("/note", { id, text, replace, author, at: noteStamp() });
+  if (!res) return;
+  byId.get(id).readme = res.readme;
+  noteEdit = null; select(id);
+}
+function wireNotes(id) {
+  const ta = document.getElementById("note-text");
+  if (ta && noteEdit && noteEdit.id === id) {
+    const e = notesSplit(byId.get(id).readme || "").entries.find(x => x.ts === noteEdit.ts);
+    ta.value = e ? e.text : ""; ta.focus();
+  }
+  const on = (bid, fn) => { const b = document.getElementById(bid); if (b) b.addEventListener("click", fn); };
+  on("note-save", () => {
+    const text = (ta.value || "").trim();
+    if (!text) { ta.focus(); return; }
+    submitNote(id, text, noteEdit && noteEdit.id === id ? noteEdit.ts : "");
+  });
+  on("note-cancel", () => { noteEdit = null; select(id); });
+  side.querySelectorAll("[data-note-edit]").forEach(a => a.addEventListener("click", ev => {
+    ev.preventDefault(); noteEdit = { id, ts: a.dataset.noteEdit }; select(id);
+  }));
+  side.querySelectorAll("[data-note-del]").forEach(a => a.addEventListener("click", ev => {
+    ev.preventDefault();
+    if (!confirm("Delete this note?")) return;
+    submitNote(id, "", a.dataset.noteDel);
+  }));
 }
 
 /* ---- minimal markdown ------------------------------------------------------------------ */
