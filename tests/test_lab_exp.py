@@ -321,48 +321,47 @@ class LabExpTests(unittest.TestCase):
 
     # ---- notes: dated entries in the README, from the CLI, the hub's queue, or the live server ----
 
-    def test_notes_add_edit_delete_via_cli_and_intents(self):
+    def test_notes_set_append_remove_via_cli_and_intents(self):
         import base64
         self.p.init()
         a = self.p.new("base")
-        out = self.p.run("note", a, "--text", "first thought", "--author", "Renzo", "--at", "2026-09-21T10:00Z").stdout
-        self.assertIn("note added (2026-09-21T10:00Z)", out)
+        self.p.run("note", a, "--set", "First thought.\n\n- a list item\n- with **markdown**")
         txt = self.p.readme(a).read_text()
-        self.assertIn("## Notes\n- **2026-09-21T10:00Z** (Renzo): first thought\n", txt)
-        # a second note (multi-line) appends; the first stays
-        self.p.run("note", a, "--text", "line one\nline two", "--at", "2026-09-21T11:00Z")
-        txt = self.p.readme(a).read_text()
-        self.assertIn("- **2026-09-21T11:00Z**: line one\n  line two\n", txt)
-        self.assertEqual(txt.count("- **2026-09-21T"), 2)
-        self.assertIn("first thought", self.p.run("note", a, "--list").stdout)
-        # edit by stamp, through the hub's queued-marks document (text base64 so quotes survive)
-        b = base64.b64encode('edited "quoted" text'.encode()).decode()
+        self.assertIn("## Notes\n\nFirst thought.\n\n- a list item\n- with **markdown**\n", txt)
+        self.assertIn("## Hypothesis", txt)                                       # the record is untouched
+        self.assertEqual(self.p.run("note", a, "--list").stdout.strip(), "First thought.\n\n- a list item\n- with **markdown**")
+        # an agent appends a dated paragraph; the user's text stays first
+        self.p.run("note", a, "--append", "seed 3 rerun queued", "--author", "orch-x")
+        body = self.p.run("note", a, "--list").stdout
+        self.assertTrue(body.startswith("First thought."))
+        self.assertRegex(body, r"\*\*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\*\* \(orch-x\): seed 3 rerun queued")
+        # the hub's queued mark replaces the whole block (base64 so quotes and newlines survive)
+        b = base64.b64encode('Rewritten "whole".\n\nSecond paragraph.'.encode()).decode()
         doc = self.p.tmp / "intents.txt"
-        doc.write_text(f"lab-exp intents v1\nproject: proj\nnote {a} --at 2026-09-21T10:00Z --replace 2026-09-21T10:00Z --author Renzo --b64 {b}\n")
-        out = self.p.run("intents", str(doc)).stdout
-        self.assertIn("note edited", out)
+        doc.write_text(f"lab-exp intents v1\nproject: proj\nnote {a} --b64 {b}\n")
+        self.assertIn("notes set", self.p.run("intents", str(doc)).stdout)
+        self.assertEqual(self.p.run("note", a, "--list").stdout.strip(), 'Rewritten "whole".\n\nSecond paragraph.')
+        self.assertNotIn("First thought", self.p.readme(a).read_text())
+        # the section sits at the end and a later Follow-ups section survives beside it
+        self.p.run("done", a, "--finding", "it works", "--follow-up", "check Y")
         txt = self.p.readme(a).read_text()
-        self.assertIn('- **2026-09-21T10:00Z** (Renzo): edited "quoted" text\n', txt)
-        self.assertNotIn("first thought", txt)
-        # delete = empty text with --replace; the section disappears with its last note
-        self.p.run("note", a, "--replace", "2026-09-21T10:00Z", "--text", "")
-        self.p.run("note", a, "--replace", "2026-09-21T11:00Z", "--text", "")
+        self.assertIn("## Follow-ups", txt)
+        self.assertIn('Rewritten "whole".', self.p.run("note", a, "--list").stdout)
+        # empty text removes the section, nothing else
+        self.p.run("note", a, "--set", "")
         txt = self.p.readme(a).read_text()
         self.assertNotIn("## Notes", txt)
-        self.assertNotIn("line one", txt)
-        # the rest of the README is untouched by all of that
-        self.assertIn("## Hypothesis", txt)
-        r = self.p.run("note", a, "--replace", "2026-01-01T00:00Z", "--text", "x", check=False)
-        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("## Follow-ups", txt)
+        self.assertIn("- [ ] check Y", txt)
 
     def test_dag_page_has_notes_ui(self):
         self.p.init()
         a = self.p.new("base")
-        self.p.run("note", a, "--text", "hello note", "--at", "2026-09-21T10:00Z")
+        self.p.run("note", a, "--set", "hello **note**")
         site = self.p.tmp / "site_notes"
         self.p.run("hub", "--out", str(site))
         txt = (site / "proj" / "index.html").read_text()
-        for needle in ("function notesSplit", "function noteUpsertText", 'id="note-text"', "note-save", "--b64", "hello note"):
+        for needle in ("function notesSplit", "function notesSetText", "Orchestrator summary", "note-save", "--b64", "hello **note**"):
             self.assertIn(needle, txt)
 
     # ---- live hub: index + per-project DAG + reports + writes, in one process -------------------
@@ -400,9 +399,9 @@ class LabExpTests(unittest.TestCase):
             self.assertIn("const LIVE = true", dag)
             self.assertIn(a, dag)
             self.assertEqual(get("/proj/report/" + a + "/report.html")[1], "<p>live report</p>")
-            res = post("/proj/note", {"id": a, "text": "from the live hub", "author": "Renzo", "at": "2026-09-21T12:00Z"})
+            res = post("/proj/note", {"id": a, "text": "from the live hub\n\nwith a second line"})
             self.assertTrue(res["ok"])
-            self.assertIn("- **2026-09-21T12:00Z** (Renzo): from the live hub", self.p.readme(a).read_text())
+            self.assertIn("## Notes\n\nfrom the live hub\n\nwith a second line\n", self.p.readme(a).read_text())
             res = post("/proj/important", {"id": a, "on": True})
             self.assertIn("important", res["tags"])
             self.assertIn("from the live hub", get("/proj/")[1])    # the next load already shows the write

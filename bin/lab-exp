@@ -1303,12 +1303,10 @@ def append_result_note(readme, note):
     readme.write_text(txt)
 
 
-# ---- README notes: dated entries a human (or an agent) attaches to an experiment ---------------
-# `## Notes` holds one list item per note: `- **<ts>** (<author>): <text>`, continuation lines
-# indented by two spaces. The timestamp is the note's identity (edits and deletions name it), so
-# the hub can queue an edit from the phone and the box applies it to the right entry later.
+# ---- README notes: the user's own free-form markdown about an experiment --------------------
+# `## Notes` is one block the user owns (the hub edits it whole, as markdown); everything else in
+# the README is the orchestrator's record. The section ends at the next h1/h2 heading.
 NOTES_HEAD = "## Notes"
-NOTE_LINE = re.compile(r"^- \*\*(\S+)\*\*(?: \(([^)]*)\))?: ?(.*)$")
 
 
 def note_stamp():
@@ -1316,86 +1314,68 @@ def note_stamp():
 
 
 def notes_split(txt):
-    """(before, entries, after): the README text around its ## Notes section, with the entries
-    parsed as [ts, author, text] lists. No section: (txt, [], "")."""
+    """(before, body, after): the README text around its ## Notes section; body is the section's
+    markdown with the outer blank lines trimmed. No section: (txt, "", "")."""
     m = re.search(r"^## Notes[ \t]*\n", txt, re.M)
     if not m:
-        return txt, [], ""
+        return txt, "", ""
     start = m.end()
     m2 = re.search(r"^#{1,2} ", txt[start:], re.M)          # the next h1/h2 ends the section
     end = start + m2.start() if m2 else len(txt)
-    entries = []
-    for line in txt[start:end].splitlines():
-        mm = NOTE_LINE.match(line)
-        if mm:
-            entries.append([mm.group(1), mm.group(2) or "", mm.group(3)])
-        elif line.startswith("  ") and entries:
-            entries[-1][2] += "\n" + line[2:]
-    return txt[:m.start()], entries, txt[end:]
-
-
-def notes_render(entries):
-    lines = [NOTES_HEAD]
-    for ts, author, text in entries:
-        first, *rest = (text or "").split("\n")
-        lines.append(f"- **{ts}**" + (f" ({author})" if author else "") + f": {first}")
-        lines.extend("  " + r for r in rest)
-    return "\n".join(lines) + "\n"
+    return txt[:m.start()], txt[start:end].strip("\n"), txt[end:]
 
 
 def notes_read(readme):
-    """[(ts, author, text)] of an experiment's notes."""
-    return [tuple(e) for e in notes_split(readme.read_text() if readme.is_file() else "")[1]]
+    """The experiment's notes markdown ("" when none)."""
+    return notes_split(readme.read_text() if readme.is_file() else "")[1]
 
 
-def note_upsert(readme, ts, text, author="", replace=""):
-    """Add a note (stamped `ts`), or with `replace=<ts>` rewrite that entry's text -- empty text
-    deletes it. Returns the new README text. The one writer of the Notes section: the CLI, the
-    hub's queued marks and the live server all go through here."""
+def notes_set(readme, text):
+    """Replace the whole ## Notes section with `text` (markdown); empty text removes the section.
+    Returns the new README text. The one writer of the section: the CLI, the hub's queued marks
+    and the live server all go through here."""
     txt = readme.read_text() if readme.is_file() else ""
-    before, entries, after = notes_split(txt)
-    text = (text or "").strip()
-    if replace:
-        idx = next((i for i, e in enumerate(entries) if e[0] == replace), None)
-        if idx is None:
-            raise ValueError(f"no note stamped {replace}")
-        if text:
-            entries[idx][2] = text
-            if author:
-                entries[idx][1] = author
-        else:
-            del entries[idx]
-    else:
-        if not text:
-            raise ValueError("empty note")
-        entries.append([ts or note_stamp(), author, text])
-    section = notes_render(entries) if entries else ""
+    before, _body, after = notes_split(txt)
+    text = (text or "").strip("\n").rstrip()
+    section = f"{NOTES_HEAD}\n\n{text}\n\n" if text else ""
     if re.search(r"^## Notes[ \t]*\n", txt, re.M):
-        new = before + section + after
+        new = before.rstrip("\n") + ("\n\n" if before.strip() else "") + section + after.lstrip("\n")
+        if not section and after.strip():
+            new = before.rstrip("\n") + "\n\n" + after.lstrip("\n")
+        if not section and not after.strip():
+            new = before.rstrip("\n") + "\n"
     else:
-        new = txt.rstrip("\n") + "\n\n" + section
+        new = txt.rstrip("\n") + "\n\n" + section if section else txt
     readme.write_text(new)
     hub_touch()
     return new
 
 
+def notes_append(readme, text, author=""):
+    """Add a dated paragraph at the end of the notes (what an agent does; the user edits whole)."""
+    body = notes_read(readme)
+    line = f"**{note_stamp()}**" + (f" ({author})" if author else "") + f": {text.strip()}"
+    return notes_set(readme, (body + "\n\n" if body else "") + line)
+
+
 def cmd_note(a):
-    """lab-exp note <id> --text "..."           add a dated note to the experiment's README
-       lab-exp note <id> --replace TS --text ""  edit (or, with empty text, delete) the note stamped TS
-       lab-exp note <id> --list                  print the notes"""
+    """lab-exp note <id> --set "markdown"      replace the experiment's notes (empty string removes them)
+       lab-exp note <id> --append "text"       add a dated paragraph (orchestrators pass --author)
+       lab-exp note <id> --list                print the notes"""
     root = find_root(a.root)
     readme = exp_dir(root, a.id) / "README.md"
     if a.list:
-        for ts, author, text in notes_read(readme):
-            print(f"{ts}" + (f" ({author})" if author else "") + f": {text}")
+        print(notes_read(readme))
         return
-    text = a.text if a.text is not None else (base64.b64decode(a.b64).decode() if a.b64 else "")
-    ts = a.at or note_stamp()
-    try:
-        note_upsert(readme, ts, text, a.author or "", a.replace or "")
-    except ValueError as e:
-        die(str(e))
-    print(f"{exp_dir(root, a.id).name}: note {'deleted' if a.replace and not text.strip() else ('edited' if a.replace else 'added')} ({a.replace or ts})")
+    if a.set is not None or a.b64:
+        text = a.set if a.set is not None else base64.b64decode(a.b64).decode()
+        notes_set(readme, text)
+        print(f"{exp_dir(root, a.id).name}: notes {'removed' if not text.strip() else 'set'}")
+    elif a.append is not None:
+        notes_append(readme, a.append, a.author or "")
+        print(f"{exp_dir(root, a.id).name}: note appended")
+    else:
+        die("pass --set, --append or --list")
 
 
 def append_followups(readme, items):
@@ -1782,8 +1762,7 @@ def make_live_handler(slugmap, index_html=None):
                     tags = do_set_important(root, req["id"], bool(req.get("on")))
                     out = {"ok": True, "id": req["id"], "on": bool(req.get("on")), "tags": tags}
                 elif rest == "/note":
-                    txt = note_upsert(exp_dir(root, req["id"]) / "README.md", req.get("at") or note_stamp(),
-                                      req.get("text", ""), req.get("author", ""), req.get("replace", ""))
+                    txt = notes_set(exp_dir(root, req["id"]) / "README.md", req.get("text", ""))
                     out = {"ok": True, "id": req["id"], "readme": txt}
                 else:
                     raise ValueError(f"unknown endpoint {rest}")
@@ -2095,7 +2074,7 @@ def apply_intents(text, dry_run=False):
     """Apply a 'lab-exp intents v1' document -- what the hub page composes into a GitHub issue when
     the user marks experiments from the phone. Lines: `project: NAME`, then
     `supersede ID [--by ID] [--why "..."]`, `unsupersede ID`, `important ID`, `unimportant ID`,
-    `note ID --at TS (--b64 B64 | --text "...") [--replace TS] [--author NAME]`.
+    `note ID --b64 B64` (the whole notes block, markdown) or `note ID --append "..." [--author NAME]`.
     Returns (results, applicable): results = [(OK|FAIL|SKIP|DRY, line, detail)]; applicable is
     False when no line targets a project on this machine (another site's publisher owns it)."""
     roots = {}
@@ -2133,16 +2112,20 @@ def apply_intents(text, dry_run=False):
                 do_unsupersede(root, args[0])
                 results.append(("OK", line, f"{exp_dir(root, args[0]).name} restored to done"))
             elif op == "note":
-                # text travels base64 (--b64): the issue body is line-based and the note may hold
-                # quotes, backslashes and newlines; --text stays for hand-written lines.
+                # the whole notes block travels base64 (--b64): the issue body is line-based and
+                # markdown holds quotes, backslashes and newlines; --append adds a dated paragraph.
                 sp = argparse.ArgumentParser(prog="note", add_help=False)
-                sp.add_argument("id"); sp.add_argument("--at", default=""); sp.add_argument("--text", default=None)
-                sp.add_argument("--b64", default=""); sp.add_argument("--replace", default=""); sp.add_argument("--author", default="")
+                sp.add_argument("id"); sp.add_argument("--b64", default=""); sp.add_argument("--append", default=None)
+                sp.add_argument("--author", default="")
                 o = sp.parse_args(args)
-                text = o.text if o.text is not None else (base64.b64decode(o.b64).decode() if o.b64 else "")
-                note_upsert(exp_dir(root, o.id) / "README.md", o.at or note_stamp(), text, o.author, o.replace)
-                what = "deleted" if o.replace and not text.strip() else ("edited" if o.replace else "added")
-                results.append(("OK", line, f"{exp_dir(root, o.id).name} note {what}"))
+                if o.append is not None:
+                    notes_append(exp_dir(root, o.id) / "README.md", o.append, o.author)
+                    what = "appended"
+                else:
+                    text = base64.b64decode(o.b64).decode() if o.b64 else ""
+                    notes_set(exp_dir(root, o.id) / "README.md", text)
+                    what = "removed" if not text.strip() else "set"
+                results.append(("OK", line, f"{exp_dir(root, o.id).name} notes {what}"))
             else:
                 do_set_important(root, args[0], op == "important")
                 results.append(("OK", line, f"{exp_dir(root, args[0]).name} {'marked' if op == 'important' else 'unmarked'} important"))
@@ -2906,14 +2889,13 @@ def main():
     s.add_argument("--undo", action="store_true", help="remove the tag")
     s.add_argument("--root", default=None)
 
-    s = sub.add_parser("note", help="add, edit or delete a dated note in an experiment's README (## Notes); the hub shows them")
+    s = sub.add_parser("note", help="the user's notes on an experiment (README ## Notes, free-form markdown; the hub edits it)")
     s.add_argument("id")
-    s.add_argument("--text", default=None, help="the note; with --replace, empty text deletes that note")
-    s.add_argument("--b64", default="", help="the note, base64-encoded (what the hub's queued marks send)")
-    s.add_argument("--replace", default="", metavar="TS", help="edit the note stamped TS instead of adding one")
-    s.add_argument("--author", default="", help="shown beside the stamp (an orchestrator passes its name)")
-    s.add_argument("--at", default="", metavar="TS", help="stamp to use (default: now, UTC, to the minute)")
-    s.add_argument("--list", action="store_true", help="print the experiment's notes")
+    s.add_argument("--set", default=None, metavar="MARKDOWN", help="replace the notes; an empty string removes them")
+    s.add_argument("--b64", default="", help="replace the notes with this base64-encoded markdown (what queued marks send)")
+    s.add_argument("--append", default=None, metavar="TEXT", help="add a dated paragraph at the end (agents pass --author)")
+    s.add_argument("--author", default="", help="name shown on an appended paragraph")
+    s.add_argument("--list", action="store_true", help="print the notes")
     s.add_argument("--root", default=None)
 
     s = sub.add_parser("supersede", help="mark an experiment overridden by a later one (status change; nothing is deleted)")
