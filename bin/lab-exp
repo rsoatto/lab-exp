@@ -1681,13 +1681,39 @@ def hub_slug(name):
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "project"
 
 
-def make_live_handler(slugmap, index_html=None):
+def find_experiments(slugmap, text):
+    """[(slug, id)] for an experiment named by `text` across the projects in `slugmap`: exact
+    directory names first, else ids ending in "-<text>" (the slug without its date), else ids
+    containing it. Case-insensitive; the first non-empty tier wins."""
+    t = text.strip().lower()
+    tiers = ([], [], [])
+    if not t:
+        return []
+    for slug, root in slugmap.items():
+        for d in exp_dirs(root):
+            n = d.name.lower()
+            i = 0 if n == t else 1 if n.endswith("-" + t) else 2 if t in n else None
+            if i is not None:
+                tiers[i].append((slug, d.name))
+    return next((x for x in tiers if x), [])
+
+
+def _goto_page(title, body):
+    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{_html.escape(title)}</title><body style='font:15px/1.5 -apple-system,system-ui,sans-serif;"
+            f"padding:24px;max-width:760px'>{body}<p><a href='/'>all projects</a></p></body>")
+
+
+def make_live_handler(slugmap, index_html=None, peer=""):
     """The request handler behind both live servers. `slugmap` maps a URL prefix to a project
     root: {"": root} serves one project at /, {slug: root, ...} serves a hub at / with each
     project under /<slug>/. Every GET re-renders from the registry; the page's buttons POST back
-    to <prefix>/{supersede,undo,important,note} with the same locked writes as the CLI."""
+    to <prefix>/{supersede,undo,important,note} with the same locked writes as the CLI.
+    /x/<experiment id> finds the experiment in whichever project holds it and redirects to its
+    node (<prefix>/?id=<id>); an id this server doesn't have goes on to `peer` (the other
+    machine's live hub, as the browser reaches it) once, so one link works for either site."""
     from http.server import BaseHTTPRequestHandler
-    from urllib.parse import unquote
+    from urllib.parse import unquote, quote, parse_qs
 
     def resolve(path):
         """(root, prefix, rest): the project a path addresses and the path inside it."""
@@ -1713,9 +1739,32 @@ def make_live_handler(slugmap, index_html=None):
             self.end_headers()
             self.wfile.write(b)
 
+        def _goto(self, text, hopped):
+            """/x/<text>: one match -> its node; several -> a list; none -> the peer, then 404."""
+            hits = find_experiments(slugmap, text)
+            if len(hits) == 1:
+                slug, eid = hits[0]
+                self._send(302, "", "text/plain", {"Location": (f"/{slug}/" if slug else "/") + "?id=" + quote(eid)}); return
+            if hits:
+                items = "".join(f"<li><a href='{('/' + slug + '/') if slug else '/'}?id={quote(eid)}'>{_html.escape(eid)}</a>"
+                                f"{(' <span style=color:#888>(' + _html.escape(slug) + ')</span>') if slug else ''}</li>"
+                                for slug, eid in hits[:200])
+                self._send(300, _goto_page(text, f"<h2>{len(hits)} experiments match “{_html.escape(text)}”</h2><ul>{items}</ul>"),
+                           "text/html; charset=utf-8"); return
+            if peer and not hopped:
+                self._send(302, "", "text/plain", {"Location": peer.rstrip("/") + "/x/" + quote(text) + "?hop=1"}); return
+            here = socket.gethostname().split(".")[0]
+            self._send(404, _goto_page(text, f"<h2>No experiment matches “{_html.escape(text)}”</h2><p>Searched the live hub on "
+                                             f"{_html.escape(here)}{' and the other site' if hopped else ''}.</p>"),
+                       "text/html; charset=utf-8")
+
         def do_GET(self):
             if self.path.split("?", 1)[0] == "/healthz":
                 self._send(200, "ok", "text/plain"); return
+            bare = self.path.split("?", 1)[0]
+            if bare.startswith("/x/") and "x" not in slugmap:
+                qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                self._goto(unquote(bare[3:]).strip("/"), "hop" in qs); return
             root, prefix, rest = resolve(self.path)
             if root is None:
                 if self.path.split("?", 1)[0] == "/" and index_html is not None:
@@ -1791,7 +1840,7 @@ def dag_serve(root, port):
         print("\nstopped")
 
 
-def hub_serve(roots, port, bind="127.0.0.1", block=True):
+def hub_serve(roots, port, bind="127.0.0.1", block=True, peer=""):
     """The LIVE hub: one process serving every project on this machine -- the index at /, each
     project's DAG at /<slug>/ (re-read on every load), its reports, and the write endpoints. This
     is the laptop's write surface (reached through an ssh tunnel); the published static hub is the
@@ -1801,7 +1850,7 @@ def hub_serve(roots, port, bind="127.0.0.1", block=True):
     slugmap = {}
     for root in roots:
         slugmap[hub_slug(load_cfg(root)["project"].get("name") or root.name)] = root
-    srv = ThreadingHTTPServer((bind, port or 0), make_live_handler(slugmap, lambda: hub_index_html(roots, live=True)))
+    srv = ThreadingHTTPServer((bind, port or 0), make_live_handler(slugmap, lambda: hub_index_html(roots, live=True), peer))
     if not block:
         return srv
     port = srv.server_address[1]
@@ -2055,7 +2104,7 @@ a.card:hover{border-color:#888}.name{font-weight:600;font-size:16px}.meta{color:
 .n{font-variant-numeric:tabular-nums}.recent{margin-top:8px;font-size:13px}.recent li{margin:2px 0}
 .cardwrap{display:block}.links{margin:-6px 0 10px;padding:0 2px;font-size:13px}
 .links a{color:#2f6fd0;text-decoration:none;margin-right:10px}.links a:hover{text-decoration:underline}</style>
-<h1>lab-exp hub</h1><p class="sub">{machine} · generated {when}. Click a project for its experiment DAG; reports open from a node's panel.</p>
+<h1>lab-exp hub</h1><p class="sub">{machine} · generated {when}. Click a project for its experiment DAG; reports open from a node's panel.</p>{go}
 <div class="grid">{cards}</div>"""
 
 
@@ -2227,8 +2276,11 @@ def hub_index_html(roots, live=False, out=None, cap=None, intents="", quiet=Fals
             print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
     sub = ("live: every page re-reads the registry, and marks and notes are written the moment you make them"
            if live else f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    go = ('<form class="go" style="margin:0 0 18px" onsubmit="var v=this.q.value.trim();if(v)location.href=\'x/\'+'
+          'encodeURIComponent(v);return false"><input name="q" placeholder="open an experiment: paste its id or part of it" '
+          'style="width:min(520px,100%);font:inherit;padding:7px 10px;border:1px solid #ccc;border-radius:7px"></form>') if live else ""
     return (HUB_INDEX.replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
-            .replace("{when}", sub).replace("{cards}", "".join(cards)))
+            .replace("{when}", sub).replace("{go}", go).replace("{cards}", "".join(cards)))
 
 
 def cmd_hub(a):
@@ -2246,7 +2298,7 @@ def cmd_hub(a):
     if not roots:
         die("no lab-exp projects found (none registered in " + str(PROJECTS_TSV) + ", or pass --projects)")
     if a.serve:
-        return hub_serve(roots, a.port, a.bind)
+        return hub_serve(roots, a.port, a.bind, peer=a.peer)
     if not a.out:
         die("--out DIR (static site) or --serve (live server) is required")
     out = Path(a.out).resolve()
@@ -2983,6 +3035,8 @@ def main():
     s.add_argument("--serve", action="store_true", help="serve the hub live instead (writes go straight through)")
     s.add_argument("--port", type=int, default=0, help="port for --serve (default: ephemeral)")
     s.add_argument("--bind", default="127.0.0.1", help="interface for --serve (default localhost: reach it over an ssh tunnel)")
+    s.add_argument("--peer", default="", metavar="URL", help="--serve: the other machine's live hub as the browser reaches it "
+                   "(e.g. http://localhost:8791); /x/<id> links for experiments not here go on to it")
     s.add_argument("--max-mb", default=25, help="reports above this size become a pointer page (default 25)")
     s.add_argument("--projects", help="comma-separated project roots (default: every registered project)")
     s.add_argument("--intents", default="", metavar="URL",

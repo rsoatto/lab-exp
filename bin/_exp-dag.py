@@ -692,7 +692,7 @@ function select(id) {
   side.className = "";
   side.innerHTML = `
     <h2>${esc(id.replace(/^\d{8}-/, ""))}</h2>
-    <div class="meta">${esc(id)}</div>
+    <div class="meta">${esc(id)} · <a href="${LIVE ? "../x/" : "?id="}${encodeURIComponent(id)}" title="a link that opens this experiment (copy it)">link</a></div>
     ${CAN_MARK ? `<div class="actions">${picking && picking.old === id
         ? `<button id="btn-nosucc">supersede with NO successor</button><button id="btn-cancel">cancel</button>`
         : n.status === "superseded"
@@ -951,6 +951,28 @@ for (const id of ["datefrom", "dateto"])
 })();
 buildDom();
 refilter({ instant: true });
+/* ---- ?id=<experiment>: open ONE experiment, framed and selected (the live hub's /x/<id> lands
+   here). An exact id, else the one id ending in "-<text>", else the one containing it; several or
+   none fall back to a search for the text, which moves the matches into the focused band. */
+(() => {
+  const P = new URLSearchParams(location.search || location.hash.replace(/^#/, "?"));
+  const want = (P.get("id") || "").trim().toLowerCase();
+  if (!want) return;
+  const tier = [ALL_IDS.filter(i => i.toLowerCase() === want), ALL_IDS.filter(i => i.toLowerCase().endsWith("-" + want)),
+                ALL_IDS.filter(i => i.toLowerCase().includes(want))].find(t => t.length) || [];
+  if (tier.length !== 1) { q.value = want; q.dispatchEvent(new Event("input")); return; }
+  const id = tier[0];
+  const frameIt = () => { const p = POS.get(id); if (p) frameBox(p.x - 160, p.y - 90, p.x + p.w + 160, p.y + p.h + 90, 60, 1); };
+  frameIt(); select(id);
+  // A window opened from another app (an Obsidian link) or a pane sliding open is still settling
+  // when this runs, and a frame computed against the wrong size misses the node. Re-frame on any
+  // size change in the first seconds, until the user pans, zooms, clicks or types.
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(frameIt), stop = () => ro.disconnect();
+    ro.observe(gdiv); setTimeout(stop, 4000);
+    ["pointerdown", "wheel", "keydown"].forEach(t => addEventListener(t, stop, { once: true, capture: true }));
+  }
+})();
 if (LIVE) {
   // A live page is a window onto the registry: coming back to the tab after a while shows what
   // landed meanwhile (the boxes keep recording). Fresh tabs (under a minute) are left alone.

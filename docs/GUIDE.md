@@ -79,7 +79,8 @@ project/
    `out/run-meta.json` (git SHA — commit first, dirty trees are flagged — exact command, host,
    GPUs) and sets all wandb env vars (your code just calls `wandb.init()` bare). When it finishes:
    `lab-exp done <id> --finding "..." --metrics k=v,...` — an experiment without a recorded
-   finding is unfinished. The README's `## Notes` section belongs to the user: free-form markdown the hub shows above the
+   finding is unfinished. To point someone at one experiment, give its id: the live hub opens it at
+   `/x/<id>`, and any DAG page opens it with `?id=<id>`. The README's `## Notes` section belongs to the user: free-form markdown the hub shows above the
    orchestrator's summary and lets them edit whole (`lab-exp note <id> --set/--append/--list`; an agent may
    `--append` a dated paragraph, never rewrite it). Repeatable `--follow-up "..."` appends `- [ ] ...` checklist lines under
    the README's `## Follow-ups` section (created if missing, never duplicated) for anything a human

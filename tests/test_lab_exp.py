@@ -410,6 +410,48 @@ class LabExpTests(unittest.TestCase):
         finally:
             srv.shutdown(); srv.server_close()
 
+    def test_live_hub_goto_resolves_ids_across_projects_and_hops_to_peer(self):
+        import importlib.machinery
+        import importlib.util
+        import threading
+        import urllib.request
+        self.p.init()
+        a = self.p.new("nominees-elbow-ensemble")
+        b = self.p.new("nominees-elbow-ensemble-fewer")
+        spec = importlib.util.spec_from_loader("labexp_goto", importlib.machinery.SourceFileLoader("labexp_goto", str(LAB_EXP)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kw):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False, peer="http://localhost:9999")
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def get(path):
+                try:
+                    with opener.open(f"http://127.0.0.1:{port}{path}") as r:
+                        return r.status, r.headers.get("Location", ""), r.read().decode()
+                except urllib.error.HTTPError as e:
+                    return e.code, e.headers.get("Location", ""), e.read().decode()
+            self.assertEqual(get("/x/" + a)[:2], (302, "/proj/?id=" + a))                  # exact id
+            self.assertEqual(get("/x/nominees-elbow-ensemble-fewer")[:2], (302, "/proj/?id=" + b))  # slug without date
+            code, _, body = get("/x/nominees-elbow")                                       # ambiguous: a list
+            self.assertEqual(code, 300)
+            self.assertIn(a, body); self.assertIn(b, body)
+            self.assertEqual(get("/x/not-here")[:2], (302, "http://localhost:9999/x/not-here?hop=1"))   # on to the peer
+            self.assertEqual(get("/x/not-here?hop=1")[0], 404)                             # but only once
+            self.assertIn('placeholder="open an experiment', get("/")[2])                   # the index box
+        finally:
+            srv.shutdown(); srv.server_close()
+
+    def test_dag_page_opens_one_experiment_from_id_param(self):
+        page = (LAB_EXP.parent / "_exp-dag.py").read_text()
+        self.assertIn('P.get("id")', page)
+        self.assertIn('"../x/" : "?id="', page)                                            # the panel's link
+
     # ---- intents: marks queued on the hub, applied on a box -------------------------------------
 
     def test_intents_apply_and_exit_codes(self):
