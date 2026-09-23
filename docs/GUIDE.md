@@ -100,6 +100,14 @@ project/
    self-contained file under 25 MB); `lab-exp report <id>` writes a skeleton that follows it and
    `doctor` checks the mechanical rules. Tell the user the experiment id, not a URL.
    Reproduce an old experiment at its recorded SHA via `git worktree`.
+   **Working in a git worktree is fine**: the hub, the live hub and the vault notes read the
+   project across all its worktrees (one copy per id, the most advanced status; reports from
+   whichever copy has them), and marks land on the copy the page showed. **Never retire one with
+   plain `git worktree remove`**: it counts gitignored files as clean and deletes every `out/`
+   made there. `lab-exp retire-worktree <path>` moves those results into the registered checkout
+   first and then removes it (`--dry-run` shows the plan; `doctor` warns while a worktree holds
+   results). Never copy an unmerged experiment's folder or README into the registered checkout:
+   git then refuses the branch's fast-forward.
 5. **Write the README and reports for a reader who was not there.** The README and the
    recorded finding are read far more often than the code, usually by someone who does not have
    the run in their head (often you, months later). Precise does not mean dense. Plain sentences,

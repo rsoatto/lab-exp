@@ -25,6 +25,7 @@ import argparse
 import ast
 import base64
 import contextlib
+import errno
 import fcntl
 import fnmatch
 from collections import deque
@@ -37,6 +38,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -361,6 +363,164 @@ def exp_dir(root, eid):
             return hits[0]
         die(f"no experiment '{eid}' (and no unique slug match)")
     return d
+
+
+# ---------------------------------------------------------------- checkouts (git worktrees)
+# Orchestrators develop and launch runs from git WORKTREES of a project, each with its own
+# .lab-exp.toml. An experiment made in one exists only there until its branch merges, and its out/
+# (gitignored) never merges at all -- so the registered checkout alone shows a fraction of the work.
+# The VIEW of a project is the union over its checkouts: one copy per experiment id, reports from
+# whichever copy has them. Reads (hub, pages, notes) go through project_view(); writes go to
+# view_entry()["root"], the checkout that owns the copy, so that checkout's own cache stays right.
+# Nothing is ever copied between checkouts: a README placed in the registered checkout before its
+# branch merges makes git refuse the next fast-forward ("untracked working tree files would be
+# overwritten by merge").
+
+STATUS_RANK = {"done": 3, "superseded": 3, "failed": 3, "abandoned": 3, "ran": 2, "running": 1, "planned": 0}
+
+
+def project_name(root):
+    return load_cfg(root)["project"].get("name") or Path(root).name
+
+
+def checkouts(root):
+    """[root] + the other git worktrees of root's repository that carry a .lab-exp.toml for the same
+    project (at the same path inside the worktree as root sits in its own). Just [root] outside git."""
+    root = Path(root).resolve()
+
+    def git(*args):
+        r = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=20)
+        return r.stdout if r.returncode == 0 else ""
+    try:
+        top, listing = git("rev-parse", "--show-toplevel").strip(), git("worktree", "list", "--porcelain")
+        rel = root.relative_to(Path(top).resolve()) if top else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return [root]
+    if rel is None or not listing:
+        return [root]
+    try:
+        name = project_name(root)
+    except OSError:
+        return [root]
+    out = [root]
+    for line in listing.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        try:
+            w = (Path(line[len("worktree "):]) / rel).resolve()
+            if w in out or not (w / CONFIG_NAME).is_file():
+                continue
+            if (load_cfg(w)["project"].get("name") or name) == name:
+                out.append(w)
+        except (OSError, ValueError):
+            continue          # a worktree dir that vanished, or an unreadable config: not part of the view
+    return out
+
+
+def _nonempty_dir(p):
+    try:
+        return p.is_dir() and any(True for _ in p.iterdir())
+    except OSError:
+        return False
+
+
+def view_index(root, cos=None):
+    """{id: entry} over the union of a project's checkouts. entry = {"id", "root": the checkout that
+    owns the chosen copy, "dir": that copy, "out": a non-empty out/ (the owner's when it has one,
+    else the best other copy's) or None, "row": the owner's registry row}. One copy per id: an
+    existing directory beats a cache-only row, then the most advanced status (terminal > ran >
+    running > planned), then -- between copies whose READMEs differ -- the newer README; identical
+    copies belong to the first checkout (the registered one)."""
+    cos = cos or checkouts(root)
+    cands = {}
+    for co in cos:
+        for r in reg_read(co):
+            d = co / "experiments" / r["id"]
+            try:
+                mt = (d / "README.md").stat().st_mtime
+            except OSError:
+                mt = 0.0
+            cands.setdefault(r["id"], []).append(((d.is_dir(), STATUS_RANK.get(r.get("status", ""), -1), mt), co, d, r))
+    idx = {}
+    first = cos[0]
+    for eid, cs in cands.items():
+        cs.sort(key=lambda c: c[0], reverse=True)
+        _key, co, d, r = cs[0]
+        # A tie on status between copies with IDENTICAL READMEs is the same experiment checked out
+        # twice: the registered checkout owns it (a checkout's mtime is when git wrote the file, not
+        # when anyone changed it). The newer README only wins between copies that really differ.
+        top = [c for c in cs if c[0][:2] == cs[0][0][:2]]
+        home = next((c for c in top if c[1] == first), None)
+        if home is not None and home is not cs[0]:
+            try:
+                txt = (home[2] / "README.md").read_bytes()
+                if all((c[2] / "README.md").read_bytes() == txt for c in top):
+                    _key, co, d, r = home
+            except OSError:
+                pass
+        out = next((c[2] / "out" for c in cs if _nonempty_dir(c[2] / "out")), None)
+        idx[eid] = {"id": eid, "root": co, "dir": d, "out": out, "row": r}
+    return idx
+
+
+def view_entry(root, eid, idx=None):
+    """The view's copy of one experiment (a full id, or the slug after the date when unambiguous).
+    Raises ValueError (never die()s): the live server must survive a bad request."""
+    idx = view_index(root) if idx is None else idx
+    if eid in idx:
+        return idx[eid]
+    hits = [e for k, e in idx.items() if k.endswith("-" + eid)]
+    if len(hits) == 1:
+        return hits[0]
+    raise ValueError(f"no experiment '{eid}' in any checkout (and no unique slug match)")
+
+
+def view_ids(root):
+    """Experiment directory names across every checkout (cheap: no README parsing)."""
+    return sorted({d.name for co in checkouts(root) for d in exp_dirs(co)})
+
+
+@contextlib.contextmanager
+def project_view(root):
+    """A root that reads as the whole project. With no other worktrees: root itself (zero cost).
+    Otherwise a throwaway directory whose experiments/<id> are symlinks to the chosen copies (a small
+    real directory of symlinks when the reports come from another copy), with a registry cache of
+    the chosen rows, so the page, hub, report and notes code run unchanged on it. READ-ONLY: route
+    writes to view_entry(root, id)["root"]."""
+    root = Path(root).resolve()
+    cos = checkouts(root)
+    if len(cos) == 1:
+        yield root
+        return
+    idx = view_index(root, cos)
+    base = Path(tempfile.mkdtemp(prefix="lab-exp-view-"))
+    v = base / root.name                  # same basename: a project without [project] name keeps its name
+    try:
+        v.mkdir()
+        (v / CONFIG_NAME).symlink_to((root / CONFIG_NAME).resolve())
+        ex = v / "experiments"
+        ex.mkdir()
+        for eid, e in idx.items():
+            d = e["dir"]
+            if not d.is_dir():
+                continue
+            if e["out"] is None or e["out"] == d / "out":
+                (ex / eid).symlink_to(d)
+            else:
+                comp = ex / eid
+                comp.mkdir()
+                for child in d.iterdir():
+                    if child.name != "out":
+                        (comp / child.name).symlink_to(child)
+                (comp / "out").symlink_to(e["out"])
+        clean = lambda x: str(x).replace("\t", " ").replace("\n", " ")
+        with open(reg_path(v), "w") as fh:        # written directly: reg_write would signal the hub (a loop)
+            fh.write("\t".join(REG_COLS) + "\n")
+            for e in sorted(idx.values(), key=lambda e: e["id"]):
+                fh.write("\t".join(clean(e["row"].get(c, "")) for c in REG_COLS) + "\n")
+        yield v
+    finally:
+        shutil.rmtree(base, ignore_errors=True)   # unlinks the symlinks; never follows them
 
 
 def read_front(readme):
@@ -1419,13 +1579,14 @@ def cmd_done(a):
 
 
 
-def do_supersede(root, old, by, why):
+def do_supersede(root, old, by, why, succ_checked=False):
     """Registry + README effects of superseding; shared by the CLI and the live dag server.
-    Raises (never die()s) so a serving process survives a bad request."""
+    Raises (never die()s) so a serving process survives a bad request. succ_checked: `by` is a full
+    id the caller already validated (the view's successor may live in another checkout)."""
     eid = exp_dir(root, old).name
     succ = ""
     if by:
-        succ = exp_dir(root, by).name        # validates the successor exists
+        succ = by if succ_checked else exp_dir(root, by).name        # validates the successor exists
         if succ == eid:
             raise ValueError("an experiment cannot supersede itself")
     reg_upsert(root, dict(id=eid, status="superseded", superseded_by=succ))
@@ -1610,7 +1771,8 @@ def cmd_dag(a):
     root = find_root(a.root)
     if getattr(a, "serve", False):
         return dag_serve(root, a.port)
-    html_out = dag_html(root)
+    with project_view(root) as view:
+        html_out = dag_html(view)
     if a.out == "-":
         sys.stdout.write(html_out)
         return
@@ -1690,11 +1852,11 @@ def find_experiments(slugmap, text):
     if not t:
         return []
     for slug, root in slugmap.items():
-        for d in exp_dirs(root):
-            n = d.name.lower()
+        for name in view_ids(root):
+            n = name.lower()
             i = 0 if n == t else 1 if n.endswith("-" + t) else 2 if t in n else None
             if i is not None:
-                tiers[i].append((slug, d.name))
+                tiers[i].append((slug, name))
     return next((x for x in tiers if x), [])
 
 
@@ -1785,14 +1947,19 @@ def make_live_handler(slugmap, index_html=None, peer=""):
                     eid, _, rel = rest[len("/report/"):].partition("/")
                     if not rel or rel.startswith("/") or ".." in rel.split("/"):
                         raise ValueError("bad path")
-                    f = exp_dir(root, eid) / "out" / rel
+                    e = view_entry(root, eid)          # the copy the page showed, reports from any checkout
+                    if e["out"] is None:
+                        raise ValueError("no reports")
+                    f = e["out"] / rel
                     if not (f.suffix == ".html" and f.is_file()):
                         raise ValueError("not a report")
                     self._send(200, f.read_text(errors="replace"), "text/html; charset=utf-8")
                 except (Exception, SystemExit):
                     self._send(404, "no such report", "text/plain")
                 return
-            self._send(200, dag_html(root, live=True), "text/html; charset=utf-8")
+            with project_view(root) as view:
+                page = dag_html(view, live=True)
+            self._send(200, page, "text/html; charset=utf-8")
 
         def do_POST(self):
             root, prefix, rest = resolve(self.path)
@@ -1801,17 +1968,25 @@ def make_live_handler(slugmap, index_html=None, peer=""):
                 if root is None:
                     raise ValueError("no such project")
                 req = json.loads(self.rfile.read(n) or b"{}")
+                # Every write lands in the checkout that owns the copy the page showed (a worktree
+                # for an unmerged experiment), through the same locked writers as the CLI.
+                idx = view_index(root)
                 if rest == "/supersede":
-                    succ = do_supersede(root, req["old"], req.get("by", ""), req.get("why", ""))
+                    e = view_entry(root, req["old"], idx)
+                    by = view_entry(root, req["by"], idx)["id"] if req.get("by") else ""
+                    succ = do_supersede(e["root"], e["id"], by, req.get("why", ""), succ_checked=True)
                     out = {"ok": True, "old": req["old"], "by": succ}
                 elif rest == "/undo":
-                    do_unsupersede(root, req["id"])
+                    e = view_entry(root, req["id"], idx)
+                    do_unsupersede(e["root"], e["id"])
                     out = {"ok": True, "id": req["id"]}
                 elif rest == "/important":
-                    tags = do_set_important(root, req["id"], bool(req.get("on")))
+                    e = view_entry(root, req["id"], idx)
+                    tags = do_set_important(e["root"], e["id"], bool(req.get("on")))
                     out = {"ok": True, "id": req["id"], "on": bool(req.get("on")), "tags": tags}
                 elif rest == "/note":
-                    txt = notes_set(exp_dir(root, req["id"]) / "README.md", req.get("text", ""))
+                    e = view_entry(root, req["id"], idx)
+                    txt = notes_set(e["dir"] / "README.md", req.get("text", ""))
                     out = {"ok": True, "id": req["id"], "readme": txt}
                 else:
                     raise ValueError(f"unknown endpoint {rest}")
@@ -2151,15 +2326,21 @@ def apply_intents(text, dry_run=False):
             if dry_run:
                 results.append(("DRY", line, str(root)))
                 continue
+            # The phone page showed the project's VIEW (every worktree): each mark lands on the copy it
+            # showed, in the checkout that owns it.
+            idx = view_index(root)
+            owner = lambda i: view_entry(root, i, idx)
             if op == "supersede":
                 sp = argparse.ArgumentParser(prog="supersede", add_help=False)
                 sp.add_argument("id"); sp.add_argument("--by", default=""); sp.add_argument("--why", default="")
                 o = sp.parse_args(args)
-                succ = do_supersede(root, o.id, o.by, o.why)
-                results.append(("OK", line, f"{exp_dir(root, o.id).name} superseded" + (f" by {succ}" if succ else "")))
+                e = owner(o.id)
+                succ = do_supersede(e["root"], e["id"], owner(o.by)["id"] if o.by else "", o.why, succ_checked=True)
+                results.append(("OK", line, f"{e['id']} superseded" + (f" by {succ}" if succ else "")))
             elif op == "unsupersede":
-                do_unsupersede(root, args[0])
-                results.append(("OK", line, f"{exp_dir(root, args[0]).name} restored to done"))
+                e = owner(args[0])
+                do_unsupersede(e["root"], e["id"])
+                results.append(("OK", line, f"{e['id']} restored to done"))
             elif op == "note":
                 # the whole notes block travels base64 (--b64): the issue body is line-based and
                 # markdown holds quotes, backslashes and newlines; --append adds a dated paragraph.
@@ -2167,17 +2348,19 @@ def apply_intents(text, dry_run=False):
                 sp.add_argument("id"); sp.add_argument("--b64", default=""); sp.add_argument("--append", default=None)
                 sp.add_argument("--author", default="")
                 o = sp.parse_args(args)
+                e = owner(o.id)
                 if o.append is not None:
-                    notes_append(exp_dir(root, o.id) / "README.md", o.append, o.author)
+                    notes_append(e["dir"] / "README.md", o.append, o.author)
                     what = "appended"
                 else:
                     text = base64.b64decode(o.b64).decode() if o.b64 else ""
-                    notes_set(exp_dir(root, o.id) / "README.md", text)
+                    notes_set(e["dir"] / "README.md", text)
                     what = "removed" if not text.strip() else "set"
-                results.append(("OK", line, f"{exp_dir(root, o.id).name} notes {what}"))
+                results.append(("OK", line, f"{e['id']} notes {what}"))
             else:
-                do_set_important(root, args[0], op == "important")
-                results.append(("OK", line, f"{exp_dir(root, args[0]).name} {'marked' if op == 'important' else 'unmarked'} important"))
+                e = owner(args[0])
+                do_set_important(e["root"], e["id"], op == "important")
+                results.append(("OK", line, f"{e['id']} {'marked' if op == 'important' else 'unmarked'} important"))
         except SystemExit:            # exp_dir die()s on an unknown id; argparse on bad args
             results.append(("FAIL", line, "unknown experiment id or bad arguments"))
         except (IndexError, ValueError) as e:
@@ -2216,64 +2399,66 @@ def hub_index_html(roots, live=False, out=None, cap=None, intents="", quiet=Fals
     page and copies its reports (over `cap` bytes -> a pointer page) under out/<slug>/. Live: only
     counts, nothing written; cards link to /<slug>/ which the live server renders on demand."""
     cards, week = [], (date.today() - timedelta(days=7)).isoformat()
-    for root in roots:
-        cfg = load_cfg(root)
-        name = cfg["project"].get("name") or root.name
-        slug = hub_slug(name)
-        rows = reg_read(root)
-        n_rep, n_big = 0, 0
-        pdir = (out / slug) if out else None
-        if pdir:
-            if pdir.exists():
-                shutil.rmtree(pdir)
-            pdir.mkdir(parents=True)
-            (pdir / "index.html").write_text(dag_html(root, intents=intents))
-        for r in rows:
-            outd = root / "experiments" / r["id"] / "out"
-            try:
-                reps = list(outd.glob("*.html")) + list(outd.glob("*/*.html"))
-            except OSError:
-                reps = []
-            for q in reps[:20]:
-                if not pdir:
-                    n_rep += 1
-                    continue
-                dst = pdir / "experiments" / r["id"] / "out" / q.relative_to(outd)
-                dst.parent.mkdir(parents=True, exist_ok=True)
+    for real_root in roots:
+        # the project's VIEW: every git worktree's experiments, reports from whichever copy has them
+        with project_view(real_root) as root:
+            cfg = load_cfg(root)
+            name = cfg["project"].get("name") or root.name
+            slug = hub_slug(name)
+            rows = reg_read(root)
+            n_rep, n_big = 0, 0
+            pdir = (out / slug) if out else None
+            if pdir:
+                if pdir.exists():
+                    shutil.rmtree(pdir)
+                pdir.mkdir(parents=True)
+                (pdir / "index.html").write_text(dag_html(root, intents=intents))
+            for r in rows:
+                outd = root / "experiments" / r["id"] / "out"
                 try:
-                    size = q.stat().st_size
-                    if cap is not None and size > cap:
-                        n_big += 1
-                        dst.write_text(f"<!doctype html><meta charset='utf-8'><title>{r['id']}</title>"
-                                       f"<p style='font:15px system-ui;padding:20px'>This report is "
-                                       f"{size / 1048576:.0f} MB, above the hub's {cap / 1048576:.0f} MB cap. Open it on "
-                                       f"{socket.gethostname().split('.')[0]}: <code>{q}</code></p>")
-                    else:
-                        shutil.copyfile(q, dst)
+                    reps = list(outd.glob("*.html")) + list(outd.glob("*/*.html"))
+                except OSError:
+                    reps = []
+                for q in reps[:20]:
+                    if not pdir:
                         n_rep += 1
-                except OSError as e:
-                    warn(f"{r['id']}/{q.relative_to(outd)}: {e}")
-        recent = sorted((r for r in rows if r.get("date", "") >= week and r.get("finding")),
-                        key=lambda r: r["date"], reverse=True)[:3]
-        rec = "".join(f"<li>{_html.escape(r['id'])}: {_html.escape(r['finding'][:110])}</li>" for r in recent)
-        by_status = {}
-        for r in rows:
-            by_status[r.get("status", "")] = by_status.get(r.get("status", ""), 0) + 1
-        st = ", ".join(f"{v} {k}" for k, v in sorted(by_status.items(), key=lambda kv: -kv[1]))
-        # The card itself is an <a>, so the [links] anchors below cannot nest inside it (nested <a>
-        # is invalid HTML) -- they render as a sibling row in a wrapping .cardwrap instead, right
-        # after the card, so they still read as one more line of the card's meta.
-        card_a = (f'<a class="card" href="{slug}/"><div class="name">{_html.escape(name)}</div>'
-                 f'<div class="meta"><span class="n">{len(rows)}</span> experiments ({_html.escape(st)}) · '
-                 f'<span class="n">{n_rep}</span> reports{f" · {n_big} too large" if n_big else ""}'
-                 f'<br>{_html.escape(str(root))}</div>'
-                 + (f'<ul class="recent">{rec}</ul>' if rec else "") + "</a>")
-        link_anchors = hub_card_links(cfg.get("links", {}))
-        cards.append(f'<div class="cardwrap">{card_a}'
-                     + (f'<div class="links">{link_anchors}</div>' if link_anchors else "")
-                     + "</div>")
-        if not quiet:
-            print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
+                        continue
+                    dst = pdir / "experiments" / r["id"] / "out" / q.relative_to(outd)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        size = q.stat().st_size
+                        if cap is not None and size > cap:
+                            n_big += 1
+                            dst.write_text(f"<!doctype html><meta charset='utf-8'><title>{r['id']}</title>"
+                                           f"<p style='font:15px system-ui;padding:20px'>This report is "
+                                           f"{size / 1048576:.0f} MB, above the hub's {cap / 1048576:.0f} MB cap. Open it on "
+                                           f"{socket.gethostname().split('.')[0]}: <code>{q}</code></p>")
+                        else:
+                            shutil.copyfile(q, dst)
+                            n_rep += 1
+                    except OSError as e:
+                        warn(f"{r['id']}/{q.relative_to(outd)}: {e}")
+            recent = sorted((r for r in rows if r.get("date", "") >= week and r.get("finding")),
+                            key=lambda r: r["date"], reverse=True)[:3]
+            rec = "".join(f"<li>{_html.escape(r['id'])}: {_html.escape(r['finding'][:110])}</li>" for r in recent)
+            by_status = {}
+            for r in rows:
+                by_status[r.get("status", "")] = by_status.get(r.get("status", ""), 0) + 1
+            st = ", ".join(f"{v} {k}" for k, v in sorted(by_status.items(), key=lambda kv: -kv[1]))
+            # The card itself is an <a>, so the [links] anchors below cannot nest inside it (nested <a>
+            # is invalid HTML) -- they render as a sibling row in a wrapping .cardwrap instead, right
+            # after the card, so they still read as one more line of the card's meta.
+            card_a = (f'<a class="card" href="{slug}/"><div class="name">{_html.escape(name)}</div>'
+                     f'<div class="meta"><span class="n">{len(rows)}</span> experiments ({_html.escape(st)}) · '
+                     f'<span class="n">{n_rep}</span> reports{f" · {n_big} too large" if n_big else ""}'
+                     f'<br>{_html.escape(str(real_root))}</div>'
+                     + (f'<ul class="recent">{rec}</ul>' if rec else "") + "</a>")
+            link_anchors = hub_card_links(cfg.get("links", {}))
+            cards.append(f'<div class="cardwrap">{card_a}'
+                         + (f'<div class="links">{link_anchors}</div>' if link_anchors else "")
+                         + "</div>")
+            if not quiet:
+                print(f"  {slug}: {len(rows)} experiments, {n_rep} reports" + (f", {n_big} over cap" if n_big else ""))
     sub = ("live: every page re-reads the registry, and marks and notes are written the moment you make them"
            if live else f"generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     go = ('<form class="go" style="margin:0 0 18px" onsubmit="var v=this.q.value.trim();if(v)location.href=\'x/\'+'
@@ -2896,8 +3081,115 @@ def cmd_doctor(a):
         print(f"  note dead serve entry pruned: {r[1]} port {r[2]}")
     if dead:
         serves_write([r for r in serves_read() if tmux_alive(r[3])])
+    # Results only a worktree holds: `git worktree remove` counts gitignored files as clean and
+    # deletes them, so retiring such a worktree the plain way silently loses them. A warning, not a
+    # drift issue: working in a worktree is normal; removing it without retire-worktree is the risk.
+    cos = checkouts(root)
+    registered = set(project_roots()) & set(cos)
+    for co in (c for c in cos if registered and c not in registered):
+        held = [d.name for d in exp_dirs(co) if _nonempty_dir(d / "out")]
+        if held:
+            warn(f"worktree {co} holds out/ for {len(held)} experiment(s) ({', '.join(held[:3])}"
+                 f"{' …' if len(held) > 3 else ''}): `git worktree remove` would delete them -- "
+                 f"retire it with `lab-exp retire-worktree {co}`")
     print(f"doctor: {issues} issue(s)" if issues else "doctor: clean")
     sys.exit(1 if issues else 0)
+
+
+def _tree_stats(p):
+    """(entries, bytes) of a directory tree, symlinks counted as entries and never followed."""
+    n = size = 0
+    for dp, dns, fns in os.walk(p, followlinks=False):
+        for f in fns + [d for d in dns if os.path.islink(os.path.join(dp, d))]:
+            n += 1
+            try:
+                size += os.lstat(os.path.join(dp, f)).st_size
+            except OSError:
+                pass
+    return n, size
+
+
+def cmd_retire_worktree(a):
+    """Retire a git worktree of a project WITHOUT losing its results.
+
+      lab-exp retire-worktree PATH [--dry-run]
+
+    `git worktree remove` treats gitignored files as clean and deletes them, and experiments/*/out/
+    is gitignored: removing a worktree the plain way silently deletes every result made in it. This
+    first moves each non-empty experiments/<id>/out into the registered checkout's
+    experiments/<id>/out (a rename on one filesystem; across filesystems a copy, verified by entry
+    count and bytes, then the source removed), then runs `git worktree remove` WITHOUT --force, so
+    git still refuses a worktree with uncommitted or untracked work. Refuses before moving anything
+    when a destination already has content. Running experiments stay put, and the worktree is kept
+    while any of them hold data. Only out/ moves: an unmerged experiment's README stays in its
+    branch (placing it in the registered checkout makes git refuse the next fast-forward), and the
+    hub lists that experiment again once the branch merges."""
+    wt = Path(a.path).resolve()
+    if not (wt / CONFIG_NAME).is_file():
+        die(f"{wt}: no {CONFIG_NAME} here -- pass the worktree's project directory")
+    home = next((r for r in project_roots() if r != wt and wt in checkouts(r)), None)
+    if home is None:
+        die(f"{wt} is not a worktree of a lab-exp project registered on this machine (see `lab-exp projects`)")
+    rows = {r["id"]: r for r in reg_read(wt)}
+    moves, running, conflicts = [], [], []
+    for d in exp_dirs(wt):
+        src = d / "out"
+        if not _nonempty_dir(src):
+            continue
+        if rows.get(d.name, {}).get("status") == "running":
+            running.append(d.name)
+            continue
+        dst = home / "experiments" / d.name / "out"
+        if _nonempty_dir(dst) or (dst.exists() and not dst.is_dir()):
+            conflicts.append(d.name)
+        else:
+            moves.append((d.name, src, dst))
+    if conflicts:
+        die(f"nothing moved: {len(conflicts)} destination(s) under {home}/experiments already hold out/ data: "
+            f"{', '.join(conflicts[:8])}{' …' if len(conflicts) > 8 else ''} -- resolve those by hand first")
+    unmerged = [eid for eid, _s, _d in moves if not (home / "experiments" / eid / "README.md").is_file()]
+    print(f"retire {wt}  ->  results into {home}/experiments")
+    print(f"  {len(moves)} out/ to move" + (f" ({len(unmerged)} of them not merged yet: the hub lists those once "
+                                             f"their branch merges)" if unmerged else ""))
+    if running:
+        print(f"  {len(running)} running, left in place: {', '.join(running)}")
+    if a.dry_run:
+        for eid, _src, dst in moves:
+            print(f"  would move {eid}/out")
+        print("  then: " + ("keep the worktree (running experiments)" if running else f"git worktree remove {wt}"))
+        return
+    for eid, src, dst in moves:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_dir():
+            dst.rmdir()                        # empty (checked above)
+        try:
+            os.rename(src, dst)
+            how = "moved"
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            tmp = dst.with_name(".out.retiring")
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            shutil.copytree(src, tmp, symlinks=True)
+            if _tree_stats(tmp) != _tree_stats(src):
+                shutil.rmtree(tmp)
+                die(f"{eid}: the copy of {src} does not match its source -- nothing deleted, stopping")
+            os.rename(tmp, dst)
+            shutil.rmtree(src)
+            how = "copied across filesystems, source removed"
+        print(f"  {how}: {eid}")
+    if moves:
+        hub_touch()
+    if running:
+        print(f"worktree kept: {len(running)} running experiment(s) still write there -- rerun when they finish")
+        sys.exit(3)
+    top = subprocess.run(["git", "-C", str(wt), "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip() or str(wt)
+    r = subprocess.run(["git", "-C", str(home), "worktree", "remove", top], capture_output=True, text=True)
+    if r.returncode:
+        print(f"git worktree remove refused (results are already safe in {home}):\n  " + (r.stderr or r.stdout).strip())
+        sys.exit(1)
+    print(f"removed worktree {top}")
 
 
 # ---------------------------------------------------------------- main
@@ -3054,6 +3346,10 @@ def main():
 
     sub.add_parser("index", help="regenerate the package INDEX.md")
     sub.add_parser("doctor", help="drift checks")
+    s = sub.add_parser("retire-worktree", help="move a git worktree's experiment results (out/) into the registered "
+                       "checkout, then remove the worktree (plain `git worktree remove` deletes them)")
+    s.add_argument("path", help="the worktree's project directory")
+    s.add_argument("--dry-run", action="store_true", help="show what would move and stop")
     sub.add_parser("projects", help="list lab-exp projects on this machine")
 
     s = sub.add_parser("_stamp-hw")
@@ -3065,6 +3361,7 @@ def main():
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
      "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
      "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents, "report": cmd_report,
+     "retire-worktree": cmd_retire_worktree,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
 
 

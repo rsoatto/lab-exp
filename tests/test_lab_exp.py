@@ -452,6 +452,130 @@ class LabExpTests(unittest.TestCase):
         self.assertIn('P.get("id")', page)
         self.assertIn('"../x/" : "?id="', page)                                            # the panel's link
 
+    # ---- git worktrees: one project across checkouts ----------------------------------------------
+
+    def _mod(self):
+        import importlib.machinery
+        import importlib.util
+        spec = importlib.util.spec_from_loader("labexp_wt", importlib.machinery.SourceFileLoader("labexp_wt", str(LAB_EXP)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.PROJECTS_TSV = self.p.home / ".config" / "lab" / "exp-projects.tsv"
+        mod.HUB_DIRTY = self.p.home / ".cache" / "lab" / "hub-dirty"
+        return mod
+
+    def _run_in(self, cwd, *args, rc=0):
+        r = subprocess.run([sys.executable, str(LAB_EXP), *args], cwd=cwd, env=self.p.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
+        return r
+
+    def _git_in(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.p.env, capture_output=True, text=True, check=True)
+
+    def _worktree_fixture(self):
+        """Registered checkout with `base` (done) and `shared` (planned); a worktree on a branch where
+        `shared` got done and `wt-only` exists (done, with out/report.html) -- scout's situation."""
+        self.p.init()
+        with open(self.p.root / ".gitignore", "a") as fh:
+            fh.write("out/\n")                          # results are gitignored, as in the real projects
+        a = self.p.new("base")
+        self.p.run("done", a, "--finding", "base done")
+        c = self.p.new("shared")
+        self.p.commit_all("experiments")
+        wt = self.p.tmp / "wt-feat"
+        self.p.git("worktree", "add", "-q", str(wt), "-b", "feat")
+        b = re.search(r"created experiments/(\S+)/", self._run_in(wt, "new", "wt-only", "--kind", "training").stdout)[1]
+        (wt / "experiments" / b / "out").mkdir(parents=True, exist_ok=True)
+        (wt / "experiments" / b / "out" / "report.html").write_text("<p>from the worktree</p>")
+        self._run_in(wt, "done", b, "--finding", "made in a worktree")
+        self._run_in(wt, "done", c, "--finding", "finished in the worktree")
+        self._git_in(wt, "add", "-A"); self._git_in(wt, "commit", "-q", "-m", "wt work")
+        return a, b, c, wt.resolve()
+
+    def test_worktree_view_unions_checkouts_and_the_hub_shows_each_experiment_once(self):
+        a, b, c, wt = self._worktree_fixture()
+        mod = self._mod()
+        root = self.p.root.resolve()
+        self.assertEqual(mod.checkouts(root), [root, wt])
+        idx = mod.view_index(root)
+        self.assertEqual((idx[a]["root"], idx[b]["root"], idx[c]["root"]), (root, wt, wt))   # most advanced copy wins
+        self.assertEqual(idx[c]["row"]["status"], "done")
+        site = self.p.tmp / "site"
+        mod.hub_index_html([root], out=site, quiet=True)
+        page = (site / "proj" / "index.html").read_text()
+        for eid in (a, b, c):
+            self.assertEqual(page.count(f'"id": "{eid}"'), 1, eid)                          # never twice
+        self.assertEqual((site / "proj" / "experiments" / b / "out" / "report.html").read_text(), "<p>from the worktree</p>")
+        self.assertFalse(any(Path(tempfile.gettempdir()).glob("lab-exp-view-*/proj/experiments")))  # views cleaned up
+        self.assertNotIn(b, [d.name for d in (root / "experiments").iterdir()])                  # nothing copied in
+
+    def test_worktree_view_live_writes_land_in_the_owning_checkout(self):
+        import threading
+        import urllib.request
+        a, b, c, wt = self._worktree_fixture()
+        mod = self._mod()
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def post(path, body):
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req) as r:
+                    return json.loads(r.read().decode())
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/proj/") as r:
+                self.assertIn(b, r.read().decode())
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/proj/report/{b}/report.html") as r:
+                self.assertEqual(r.read().decode(), "<p>from the worktree</p>")
+            self.assertIn("important", post("/proj/important", {"id": b, "on": True})["tags"])
+            self.assertIn("important", (wt / "experiments" / b / "README.md").read_text())
+            self.assertIn(b, (wt / "experiments" / "_registry.tsv").read_text())           # the owner's cache too
+            post("/proj/note", {"id": c, "text": "noted on the worktree copy"})
+            self.assertIn("noted on the worktree copy", (wt / "experiments" / c / "README.md").read_text())
+            self.assertNotIn("noted on the worktree copy", self.p.readme(c).read_text())
+            res = post("/proj/supersede", {"old": a, "by": b, "why": "worktree result wins"})  # successor in another checkout
+            self.assertEqual(res["by"], b)
+            self.assertIn(f"superseded_by: {b}", self.p.readme(a).read_text())
+        finally:
+            srv.shutdown(); srv.server_close()
+        results, ok = mod.apply_intents(f"project: proj\nunimportant {b}\nnote {c} --append \"from the phone\"\n")
+        self.assertTrue(ok)
+        self.assertEqual([v for v, _l, _d in results], ["OK", "OK"], results)
+        self.assertNotIn("important", mod.read_front(wt / "experiments" / b / "README.md").get("tags", ""))
+        self.assertIn("from the phone", (wt / "experiments" / c / "README.md").read_text())
+
+    def test_retire_worktree_moves_results_home_then_removes_it(self):
+        a, b, c, wt = self._worktree_fixture()
+        mod = self._mod()
+        r_id = re.search(r"created experiments/(\S+)/", self._run_in(wt, "new", "long-run", "--kind", "training").stdout)[1]
+        mod.reg_upsert(wt, dict(id=r_id, status="running"))
+        (wt / "experiments" / r_id / "out").mkdir(parents=True, exist_ok=True)
+        (wt / "experiments" / r_id / "out" / "log.txt").write_text("still going")
+        self._git_in(wt, "add", "-A"); self._git_in(wt, "commit", "-q", "-m", "running")
+        out = self._run_in(self.p.root, "retire-worktree", str(wt), rc=3).stdout       # running data: keep the worktree
+        self.assertIn("worktree kept", out)
+        self.assertEqual((self.p.root / "experiments" / b / "out" / "report.html").read_text(), "<p>from the worktree</p>")
+        self.assertFalse((wt / "experiments" / b / "out").exists())
+        self.assertTrue((wt / "experiments" / r_id / "out" / "log.txt").is_file())
+        mod.reg_upsert(wt, dict(id=r_id, status="done"))
+        self._git_in(wt, "add", "-A"); self._git_in(wt, "commit", "-q", "-m", "finished")
+        self._run_in(self.p.root, "retire-worktree", str(wt))
+        self.assertFalse(wt.exists())
+        self.assertEqual((self.p.root / "experiments" / r_id / "out" / "log.txt").read_text(), "still going")
+        self.assertNotIn(str(wt), self.p.git("worktree", "list").stdout)
+
+    def test_retire_worktree_refuses_when_home_already_has_results_and_doctor_warns(self):
+        a, b, c, wt = self._worktree_fixture()
+        doc = subprocess.run([sys.executable, str(LAB_EXP), "doctor"], cwd=self.p.root, env=self.p.env,
+                             capture_output=True, text=True).stdout              # a warning, whatever doctor's exit code
+        self.assertIn(f"worktree {wt} holds out/ for 1 experiment", doc)
+        (self.p.root / "experiments" / b / "out").mkdir(parents=True)
+        (self.p.root / "experiments" / b / "out" / "other.html").write_text("already here")
+        r = self._run_in(self.p.root, "retire-worktree", str(wt), rc=1)
+        self.assertIn("nothing moved", r.stderr)
+        self.assertTrue((wt / "experiments" / b / "out" / "report.html").is_file())
+        self.assertTrue(wt.exists())
+
     # ---- intents: marks queued on the hub, applied on a box -------------------------------------
 
     def test_intents_apply_and_exit_codes(self):
