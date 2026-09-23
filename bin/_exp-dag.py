@@ -701,6 +701,9 @@ function select(id) {
     ${(n.reports || []).length ? `<div class="actions" style="flex-wrap:wrap">${n.reports.map(rp =>
         `<a href="${LIVE ? "report/" + esc(id) + "/" + esc(rp) : esc(n.dir) + "/out/" + esc(rp)}"
             target="_blank" style="font-size:.85rem">▤ ${esc(rp.replace(/\.html$/, ""))}</a>`).join("")}</div>` : ""}
+    ${LIVE && (n.data || []).length ? `<div class="actions" style="flex-wrap:wrap">${n.data.map(dp =>
+        `<a href="data/${encodeURIComponent(id)}/${dp.split("/").map(encodeURIComponent).join("/")}" target="_blank"
+            style="font-size:.85rem" title="open as a table">▦ ${esc(dp)}</a>`).join("")}</div>` : ""}
     ${notesHtml(id, n)}
     <div class="sec"><div class="head"><h3>Orchestrator summary</h3></div>
       ${n.finding ? `<p style="font-size:.9rem;margin:.2rem 0">${esc(n.finding)}</p>` : `<div class="empty">no finding recorded yet</div>`}</div>

@@ -2,6 +2,8 @@
 
 Each test builds a throwaway project (with its own git repo and HOME) and drives the real CLI
 via subprocess, so what is tested is exactly what an agent runs."""
+import importlib.machinery
+import importlib.util
 import json
 import urllib.error
 import os
@@ -451,6 +453,47 @@ class LabExpTests(unittest.TestCase):
         page = (LAB_EXP.parent / "_exp-dag.py").read_text()
         self.assertIn('P.get("id")', page)
         self.assertIn('"../x/" : "?id="', page)                                            # the panel's link
+
+    def test_live_hub_renders_csv_tables_and_never_lists_them_on_static_pages(self):
+        import threading
+        import urllib.request
+        self.p.init()
+        a = self.p.new("tables")
+        out = self.p.root / "experiments" / a / "out"
+        (out / "sub").mkdir(parents=True)
+        (out / "scores.csv").write_text("gene,score,note\nFUS,0.91,top\nTDP43,-0.2,</script><b>x</b>\nACTB,10,\n")
+        (out / "sub" / "wide.tsv").write_text("a\tb\n1\t2\n")
+        (out / "secret.txt").write_text("not a table")
+        spec = importlib.util.spec_from_loader("labexp_csv", importlib.machinery.SourceFileLoader("labexp_csv", str(LAB_EXP)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertNotIn("scores.csv", mod.dag_html(self.p.root))                     # the published page: never
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def get(path):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as r:
+                        return r.status, r.read().decode()
+                except urllib.error.HTTPError as e:
+                    return e.code, ""
+            code, page = get("/proj/")
+            self.assertIn('"data": ["scores.csv", "sub/wide.tsv"]', page)
+            code, tbl = get(f"/proj/data/{a}/scores.csv")
+            self.assertEqual(code, 200)
+            self.assertIn('"header": ["gene", "score", "note"]', tbl)
+            self.assertIn("all 3 rows", tbl)
+            self.assertNotIn("</script><b>", tbl)                                      # cell text cannot end the script
+            self.assertIn('["a", "b"]', get(f"/proj/data/{a}/sub/wide.tsv")[1])
+            self.assertEqual(get(f"/proj/data/{a}/scores.csv?raw=1")[1].splitlines()[0], "gene,score,note")
+            for bad in (f"/proj/data/{a}/secret.txt", f"/proj/data/{a}/../README.md", f"/proj/data/{a}/nope.csv",
+                        "/proj/data/no-such-exp/scores.csv"):
+                self.assertEqual(get(bad)[0], 404, bad)
+            mod.TABLE_MAX_ROWS = 2
+            self.assertIn("the first 2 rows of a", get(f"/proj/data/{a}/scores.csv")[1])     # big files: the head only
+        finally:
+            srv.shutdown(); srv.server_close()
 
     # ---- git worktrees: one project across checkouts ----------------------------------------------
 

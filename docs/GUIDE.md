@@ -99,6 +99,9 @@ project/
    the phone by the time you report it. Style guide: [reports.md](reports.md) (answer first, KPI cards, captioned evidence, one
    self-contained file under 25 MB); `lab-exp report <id>` writes a skeleton that follows it and
    `doctor` checks the mechanical rules. Tell the user the experiment id, not a URL.
+   CSV/TSV files at the same depths (out/ top level or one folder down) open as sortable tables
+   in the LIVE hub only (the published hub never ships raw data files); big files show their first
+   5,000 rows, with the raw file one click away. A table is not a report: say what it shows in one.
    Reproduce an old experiment at its recorded SHA via `git worktree`.
    **Working in a git worktree is fine**: the hub, the live hub and the vault notes read the
    project across all its worktrees (one copy per id, the most advanced status; reports from

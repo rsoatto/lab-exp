@@ -1805,8 +1805,18 @@ def dag_html(root, live=False, intents=""):
                           key=lambda q: (q != "report.html", q))[:20]
         except OSError:
             reps = []
+        # Tables (CSV/TSV) at the same depths, LIVE pages only: the live server renders them as a
+        # table (/data/<id>/<rel>); the published hub is a public site that encrypts only its HTML,
+        # so a raw data file must never ride along there.
+        data = []
+        if live:
+            try:
+                data = sorted(q.relative_to(outd).as_posix() for pat in ("*.csv", "*.tsv", "*/*.csv", "*/*.tsv")
+                              for q in outd.glob(pat))[:30]
+            except OSError:
+                data = []
         nodes.append({k: r.get(k, "") for k in REG_COLS} | {
-            "dir": f"experiments/{eid}", "readme": readme, "reports": reps})
+            "dir": f"experiments/{eid}", "readme": readme, "reports": reps, "data": data})
     payload = {
         "project": load_cfg(root)["project"].get("name") or root.name,
         "nodes": sorted(nodes, key=lambda n: n["id"]),
@@ -1841,6 +1851,114 @@ def print_tunnel_hint(port):
 
 def hub_slug(name):
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "project"
+
+
+TABLE_MAX_ROWS = 5000                 # rows a table page shows; the rest stay one "raw" click away
+TABLE_MAX_CHARS = 16 * 1024 * 1024     # ...and never more text than this, whatever the row count
+
+
+def csv_table_html(path, eid, rel):
+    """One CSV/TSV as a self-contained page: sortable columns (numeric-aware), a filter box, sticky
+    header. Reads only the first TABLE_MAX_ROWS rows (and at most TABLE_MAX_CHARS of text), so a
+    multi-GB file opens as fast as a small one; the page says when it shows only the head."""
+    import csv
+    csv.field_size_limit(2 ** 31 - 1)
+    size = path.stat().st_size
+    rows, complete, chars = [], True, 0
+    with open(path, newline="", errors="replace") as fh:
+        head = fh.read(65536)
+        fh.seek(0)
+        if path.suffix.lower() == ".tsv":
+            dialect = csv.excel_tab
+        else:
+            try:
+                dialect = csv.Sniffer().sniff(head, delimiters=",;\t|")
+            except csv.Error:
+                dialect = csv.excel
+        for i, row in enumerate(csv.reader(fh, dialect)):
+            if i > TABLE_MAX_ROWS or chars > TABLE_MAX_CHARS:
+                complete = False
+                break
+            rows.append(row)
+            chars += sum(len(c) for c in row)
+    header, body = (rows[0], rows[1:]) if rows else ([], [])
+    width = max([len(header)] + [len(r) for r in body[:200]]) if rows else 0
+    header = header + [""] * (width - len(header))
+    mb = size / 1048576
+    what = (f"all {len(body):,} rows" if complete else
+            f"the first {len(body):,} rows of a {mb:,.1f} MB file")
+    payload = json.dumps({"header": header, "rows": body}).replace("</", "<\\/")
+    t = _html.escape(f"{rel} · {eid}")
+    return TABLE_PAGE.replace("__TITLE__", t).replace("__WHAT__", _html.escape(what)).replace("__DATA__", payload)
+
+
+TABLE_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root { --bg:#fff; --fg:#1b1b1b; --mut:#6b6b6b; --line:#e3e3e3; --head:#f6f6f4; --hi:#fff6d6; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#e8e8e8; --mut:#9a9a9a; --line:#2d2d2d; --head:#1f1f1f; --hi:#3a3420; } }
+body { margin:0; font:13px/1.4 -apple-system,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+header { position:sticky; top:0; z-index:2; background:var(--bg); padding:10px 16px; border-bottom:1px solid var(--line);
+  display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+h1 { font-size:14px; margin:0; font-weight:600; }
+.meta { color:var(--mut); } .meta a { color:inherit; }
+input { font:inherit; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:inherit; width:16rem; }
+.wrap { overflow:auto; max-height:calc(100vh - 52px); }
+table { border-collapse:collapse; font-variant-numeric:tabular-nums; }
+th, td { padding:3px 10px; border-bottom:1px solid var(--line); white-space:nowrap; max-width:36rem; overflow:hidden; text-overflow:ellipsis; }
+th { position:sticky; top:0; background:var(--head); text-align:left; cursor:pointer; user-select:none; font-weight:600; }
+th .dir { color:var(--mut); font-size:11px; }
+td.num, th.num { text-align:right; }
+tr:hover td { background:var(--hi); }
+td.rn, th.rn { color:var(--mut); text-align:right; cursor:default; }
+</style>
+<header><h1>__TITLE__</h1><span class="meta">__WHAT__ · <span id="shown"></span> · <a href="?raw=1">raw file</a></span>
+<input id="f" placeholder="filter rows (any column)" autocomplete="off"></header>
+<div class="wrap"><table><thead id="h"></thead><tbody id="b"></tbody></table></div>
+<script>
+const T = __DATA__;
+const cols = T.header.length, isNum = [];
+for (let c = 0; c < cols; c++) {
+  let seen = 0, ok = true;
+  for (const r of T.rows) { const v = (r[c] ?? "").trim(); if (!v) continue; seen++; if (isNaN(Number(v))) { ok = false; break; } }
+  isNum.push(ok && seen > 0);
+}
+const esc = s => String(s ?? "").replace(/[&<>"]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[ch]));
+let order = T.rows.map((_, i) => i), sortCol = -1, asc = true, q = "";
+function head() {
+  document.getElementById("h").innerHTML = "<tr><th class='rn'>#</th>" + T.header.map((h, c) =>
+    `<th class="${isNum[c] ? "num" : ""}" data-c="${c}">${esc(h) || "<i>col " + (c + 1) + "</i>"} <span class="dir">${c === sortCol ? (asc ? "▲" : "▼") : ""}</span></th>`).join("") + "</tr>";
+}
+function body() {
+  const rows = q ? order.filter(i => T.rows[i].some(v => String(v).toLowerCase().includes(q))) : order;
+  document.getElementById("shown").textContent = (q ? rows.length.toLocaleString() + " match" : rows.length.toLocaleString() + " shown");
+  const out = [];
+  for (const i of rows.slice(0, 5000)) {
+    const r = T.rows[i];
+    let tr = `<tr><td class="rn">${i + 1}</td>`;
+    for (let c = 0; c < cols; c++) tr += `<td class="${isNum[c] ? "num" : ""}" title="${esc(r[c])}">${esc(r[c])}</td>`;
+    out.push(tr + "</tr>");
+  }
+  document.getElementById("b").innerHTML = out.join("");
+}
+document.getElementById("h").addEventListener("click", ev => {
+  const th = ev.target.closest("th[data-c]"); if (!th) return;
+  const c = Number(th.dataset.c);
+  asc = c === sortCol ? !asc : true; sortCol = c;
+  const key = i => (T.rows[i][c] ?? "");
+  order.sort((a, b) => {
+    const x = key(a), y = key(b);
+    if (isNum[c]) { const nx = x.trim() === "" ? NaN : Number(x), ny = y.trim() === "" ? NaN : Number(y);
+      if (isNaN(nx) || isNaN(ny)) return isNaN(nx) - isNaN(ny); return asc ? nx - ny : ny - nx; }
+    return asc ? x.localeCompare(y, undefined, {numeric: true}) : y.localeCompare(x, undefined, {numeric: true});
+  });
+  head(); body();
+});
+let t = 0;
+document.getElementById("f").addEventListener("input", ev => { clearTimeout(t); t = setTimeout(() => { q = ev.target.value.trim().toLowerCase(); body(); }, 120); });
+head(); body();
+</script>
+"""
 
 
 def find_experiments(slugmap, text):
@@ -1935,6 +2053,33 @@ def make_live_handler(slugmap, index_html=None, peer=""):
             if prefix and not self.path.split("?", 1)[0].startswith("/" + prefix + "/"):
                 # /<slug> -> /<slug>/ so the page's relative api and report links resolve inside it
                 self._send(301, "", "text/plain", {"Location": "/" + prefix + "/" + (("?" + self.path.split("?", 1)[1]) if "?" in self.path else "")}); return
+            if rest.startswith("/data/"):
+                # /data/<eid>/<relpath under out/>: a CSV/TSV as a table page (?raw=1: the file itself).
+                # Same lexical confinement as /report/ below; the owner's copy via the worktree view.
+                try:
+                    eid, _, rel = rest[len("/data/"):].partition("/")
+                    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+                        raise ValueError("bad path")
+                    e = view_entry(root, eid)
+                    if e["out"] is None:
+                        raise ValueError("no data")
+                    f = e["out"] / rel
+                    if not (f.suffix.lower() in (".csv", ".tsv") and f.is_file()):
+                        raise ValueError("not a table")
+                    if "raw=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.send_header("Content-Length", str(f.stat().st_size))
+                        self.end_headers()
+                        with open(f, "rb") as fh:
+                            shutil.copyfileobj(fh, self.wfile, 1 << 20)
+                        return
+                    page = csv_table_html(f, e["id"], rel)
+                except (Exception, SystemExit):
+                    self._send(404, "no such table", "text/plain")
+                    return
+                self._send(200, page, "text/html; charset=utf-8")
+                return
             if rest.startswith("/report/"):
                 # /report/<eid>/<relpath under out/>. Both segments come off the wire: the eid
                 # resolves through exp_dir (validates existence); the relpath is confined
