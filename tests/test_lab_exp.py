@@ -319,6 +319,10 @@ class LabExpTests(unittest.TestCase):
         txt = dag.read_text()
         self.assertIn(f"experiments/{a}", txt)
         self.assertIn("report.html", txt)
+        icon = '<link rel="icon" href="data:image/svg+xml,'   # the hub's tab icon, inline on every page
+        self.assertIn(icon, idx)
+        self.assertIn(icon, txt)
+        self.assertNotIn("__FAVICON__", idx + txt)
 
 
     # ---- notes: dated entries in the README, from the CLI, the hub's queue, or the live server ----
@@ -484,6 +488,7 @@ class LabExpTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertIn('"header": ["gene", "score", "note"]', tbl)
             self.assertIn("all 3 rows", tbl)
+            self.assertIn('<link rel="icon" href="data:image/svg+xml,', tbl)
             self.assertNotIn("</script><b>", tbl)                                      # cell text cannot end the script
             self.assertIn('["a", "b"]', get(f"/proj/data/{a}/sub/wide.tsv")[1])
             self.assertEqual(get(f"/proj/data/{a}/scores.csv?raw=1")[1].splitlines()[0], "gene,score,note")

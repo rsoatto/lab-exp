@@ -1783,6 +1783,23 @@ def cmd_dag(a):
     print("  publish it:   lab-exp dag --out - | lab-report publish /dev/stdin --title '<project> — experiment DAG'")
 
 
+def _dag_module():
+    """bin/_exp-dag.py, loaded in-process: it sits beside this script (main-guarded, so import is
+    clean). Forking an interpreter per render piped the multi-MB payload through twice for three
+    str.replace calls -- noticeable when --serve re-renders on every reload. Loaded fresh on each
+    call, so a long-running server picks up template edits."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_exp_dag", Path(__file__).resolve().parent / "_exp-dag.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def hub_favicon():
+    """The <link rel="icon"> every hub page carries (defined with the DAG template)."""
+    return _dag_module().FAVICON
+
+
 def dag_html(root, live=False, intents=""):
     rows, parents, _children = graph_maps(root)
     nodes = []
@@ -1822,17 +1839,9 @@ def dag_html(root, live=False, intents=""):
         "nodes": sorted(nodes, key=lambda n: n["id"]),
         "edges": [{"child": c, "parent": p} for c, ps in parents.items() for p in ps],
     }
-    # In-process render: _exp-dag.py sits beside this script (main-guarded, so import is clean);
-    # forking an interpreter per render piped the multi-MB payload through twice for three
-    # str.replace calls -- noticeable when --serve re-renders on every reload.
-    import html as _html
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "_exp_dag", Path(__file__).resolve().parent / "_exp-dag.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = _dag_module()
     title = _html.escape(payload["project"] or "experiments", quote=True)
-    return (mod.TEMPLATE.replace("__TITLE__", title)
+    return (mod.TEMPLATE.replace("__TITLE__", title).replace("__FAVICON__", mod.FAVICON)
             .replace("__LIVE__", "true" if live else "false")
             .replace("__INTENTS__", json.dumps(intents or ""))
             .replace("__DATA__", json.dumps(payload, ensure_ascii=False)))
@@ -1889,11 +1898,13 @@ def csv_table_html(path, eid, rel):
             f"the first {len(body):,} rows of a {mb:,.1f} MB file")
     payload = json.dumps({"header": header, "rows": body}).replace("</", "<\\/")
     t = _html.escape(f"{rel} · {eid}")
-    return TABLE_PAGE.replace("__TITLE__", t).replace("__WHAT__", _html.escape(what)).replace("__DATA__", payload)
+    return (TABLE_PAGE.replace("__TITLE__", t).replace("__FAVICON__", hub_favicon())
+            .replace("__WHAT__", _html.escape(what)).replace("__DATA__", payload))
 
 
 TABLE_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
+__FAVICON__
 <style>
 :root { --bg:#fff; --fg:#1b1b1b; --mut:#6b6b6b; --line:#e3e3e3; --head:#f6f6f4; --hi:#fff6d6; }
 @media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#e8e8e8; --mut:#9a9a9a; --line:#2d2d2d; --head:#1f1f1f; --hi:#3a3420; } }
@@ -1980,7 +1991,7 @@ def find_experiments(slugmap, text):
 
 def _goto_page(title, body):
     return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<title>{_html.escape(title)}</title><body style='font:15px/1.5 -apple-system,system-ui,sans-serif;"
+            f"<title>{_html.escape(title)}</title>{hub_favicon()}<body style='font:15px/1.5 -apple-system,system-ui,sans-serif;"
             f"padding:24px;max-width:760px'>{body}<p><a href='/'>all projects</a></p></body>")
 
 
@@ -2416,6 +2427,7 @@ def cmd_registry(a):
 
 HUB_INDEX = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>lab-exp hub</title>
+__FAVICON__
 <style>body{font:15px/1.45 -apple-system,system-ui,sans-serif;margin:0;padding:20px;background:#fafafa;color:#111}
 h1{font-size:20px;margin:0 0 4px}.sub{color:#666;font-size:13px;margin:0 0 18px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
@@ -2609,7 +2621,7 @@ def hub_index_html(roots, live=False, out=None, cap=None, intents="", quiet=Fals
     go = ('<form class="go" style="margin:0 0 18px" onsubmit="var v=this.q.value.trim();if(v)location.href=\'x/\'+'
           'encodeURIComponent(v);return false"><input name="q" placeholder="open an experiment: paste its id or part of it" '
           'style="width:min(520px,100%);font:inherit;padding:7px 10px;border:1px solid #ccc;border-radius:7px"></form>') if live else ""
-    return (HUB_INDEX.replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
+    return (HUB_INDEX.replace("__FAVICON__", hub_favicon()).replace("{machine}", _html.escape(socket.gethostname().split(".")[0]))
             .replace("{when}", sub).replace("{go}", go).replace("{cards}", "".join(cards)))
 
 

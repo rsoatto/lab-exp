@@ -28,18 +28,24 @@ def main() -> int:
     live = "--live" in args
     intents = args[args.index("--intents") + 1] if "--intents" in args and args.index("--intents") + 1 < len(args) else ""
     sys.stdout.write(
-        TEMPLATE.replace("__TITLE__", title).replace("__LIVE__", "true" if live else "false")
+        TEMPLATE.replace("__TITLE__", title).replace("__FAVICON__", FAVICON)
+                .replace("__LIVE__", "true" if live else "false")
                 .replace("__INTENTS__", json.dumps(intents))
                 .replace("__DATA__", json.dumps(data, ensure_ascii=False))
     )
     return 0
 
 
+# Tab icon for every hub page (DAG, hub index, tables): a small graph on purple, inline so the
+# published, encrypted copies carry it too. lab-exp reads it from here.
+FAVICON = '<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2714%27 fill=%27%237c4dcc%27/%3E%3Cpath d=%27M32 18L19 45M32 18l13 27%27 stroke=%27%23fff%27 stroke-width=%275%27 stroke-linecap=%27round%27/%3E%3Ccircle cx=%2732%27 cy=%2717%27 r=%277.5%27 fill=%27%23fff%27/%3E%3Ccircle cx=%2718%27 cy=%2746%27 r=%277.5%27 fill=%27%23fff%27/%3E%3Ccircle cx=%2746%27 cy=%2746%27 r=%277.5%27 fill=%27%23fff%27/%3E%3C/svg%3E">'
+
 TEMPLATE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>__TITLE__ — experiment DAG</title>
+__FAVICON__
 <style>
  :root {
    color-scheme: light dark;
