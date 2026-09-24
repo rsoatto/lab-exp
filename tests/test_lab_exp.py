@@ -542,10 +542,13 @@ class LabExpTests(unittest.TestCase):
 
     def test_worktree_view_unions_checkouts_and_the_hub_shows_each_experiment_once(self):
         a, b, c, wt = self._worktree_fixture()
+        with open(wt / "experiments" / "_registry.tsv", "a") as fh:     # a stale row main has since dropped
+            fh.write("g" + "\t" * 11 + "\n")
         mod = self._mod()
         root = self.p.root.resolve()
         self.assertEqual(mod.checkouts(root), [root, wt])
         idx = mod.view_index(root)
+        self.assertNotIn("g", idx)                                       # a worktree row with no directory is not shown
         self.assertEqual((idx[a]["root"], idx[b]["root"], idx[c]["root"]), (root, wt, wt))   # most advanced copy wins
         self.assertEqual(idx[c]["row"]["status"], "done")
         site = self.p.tmp / "site"

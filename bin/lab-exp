@@ -436,6 +436,13 @@ def view_index(root, cos=None):
     for co in cos:
         for r in reg_read(co):
             d = co / "experiments" / r["id"]
+            # A worktree's registry started as a copy of the registered one at its branch point, so a
+            # row there with no directory is a stale copy, never the worktree's own experiment: FUS's
+            # morph-analysis worktree, last updated 2026-08-02, still carried an empty row "g"
+            # that main dropped on 08-03, and the hub listed it as an experiment. Only the registered
+            # checkout's cache-only rows stand (doctor's business there).
+            if co != cos[0] and not d.is_dir():
+                continue
             try:
                 mt = (d / "README.md").stat().st_mtime
             except OSError:
