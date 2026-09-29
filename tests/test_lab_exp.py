@@ -458,6 +458,34 @@ class LabExpTests(unittest.TestCase):
         self.assertIn('P.get("id")', page)
         self.assertIn('"../x/" : "?id="', page)                                            # the panel's link
 
+    def test_live_hub_on_a_private_unix_socket(self):
+        import socket as socketmod
+        import stat
+        import threading
+        self.p.init()
+        mod = self._mod()
+        d = Path(tempfile.mkdtemp(prefix="lh-", dir="/tmp")) / "hub"          # AF_UNIX paths must be short
+        sock = str(d / "hub.sock")
+        srv = mod.hub_serve([self.p.root], 0, sock=sock, block=False)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(sock).st_mode) & 0o077, 0)           # nobody else can connect
+            c = socketmod.socket(socketmod.AF_UNIX, socketmod.SOCK_STREAM)
+            c.connect(sock)
+            c.sendall(b"GET /healthz HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            reply = b""
+            while chunk := c.recv(4096):
+                reply += chunk
+            c.close()
+            self.assertTrue(reply.startswith(b"HTTP/1.0 200") and reply.endswith(b"ok"), reply[:80])
+        finally:
+            srv.shutdown(); srv.server_close()
+        os.chmod(d, 0o755)                                                         # a directory others can enter...
+        with self.assertRaises(SystemExit):
+            mod.hub_serve([self.p.root], 0, sock=sock, block=False)                # ...is refused, never used
+        shutil.rmtree(d.parent, ignore_errors=True)
+
     def test_live_hub_shows_figures_and_never_lists_them_on_static_pages(self):
         import threading
         import urllib.request

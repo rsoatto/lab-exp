@@ -2330,17 +2330,61 @@ def dag_serve(root, port):
         print("\nstopped")
 
 
-def hub_serve(roots, port, bind="127.0.0.1", block=True, peer=""):
+def serve_socket(path):
+    """Prepare `path` for a unix-socket server that only this user can open: its directory is
+    created 0700, and one that exists must already be this user's and closed to everyone else
+    (/tmp is shared, so a directory someone else made first would let them in). A stale socket
+    from a previous run is removed."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    st = os.lstat(d)
+    if st.st_uid != os.getuid() or st.st_mode & 0o077 or os.path.islink(d):
+        die(f"{d} must be a directory owned by you with mode 700 (it is {oct(st.st_mode & 0o777)}, uid {st.st_uid}): "
+            "refusing to serve the hub through it")
+    if os.path.exists(path) or os.path.islink(path):
+        os.unlink(path)
+    return path
+
+
+def hub_serve(roots, port, bind="127.0.0.1", block=True, peer="", sock=""):
     """The LIVE hub: one process serving every project on this machine -- the index at /, each
     project's DAG at /<slug>/ (re-read on every load), its reports, and the write endpoints. This
     is the laptop's write surface (reached through an ssh tunnel); the published static hub is the
     read-only phone view. Binds to localhost by default because it writes to the repos: only a
-    tunnel or a local browser should reach it. With block=False returns the server (tests)."""
+    tunnel or a local browser should reach it. With block=False returns the server (tests).
+
+    With `sock` it listens on that unix socket instead of a port: a localhost port on a shared box
+    is open to every user there, a socket in a 0700 directory only to its owner, and ssh tunnels
+    to it just the same (ssh -L 8790:/path/to.sock host)."""
     from http.server import ThreadingHTTPServer
+    import socketserver
     slugmap = {}
     for root in roots:
         slugmap[hub_slug(load_cfg(root)["project"].get("name") or root.name)] = root
-    srv = ThreadingHTTPServer((bind, port or 0), make_live_handler(slugmap, lambda: hub_index_html(roots, live=True), peer))
+    handler = make_live_handler(slugmap, lambda: hub_index_html(roots, live=True), peer)
+    if sock:
+        class UnixHub(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+        path = serve_socket(sock)                       # the 0700 directory, made before the umask below
+        old = os.umask(0o177)                           # the socket itself: rw for the owner only
+        try:
+            srv = UnixHub(path, handler)
+        finally:
+            os.umask(old)
+        if not block:
+            return srv
+        print(f"serving live hub on {socket.gethostname().split('.')[0]} at {sock}  ({len(roots)} project(s); Ctrl-C stops)")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopped")
+        finally:
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+        return
+    srv = ThreadingHTTPServer((bind, port or 0), handler)
     if not block:
         return srv
     port = srv.server_address[1]
@@ -2790,7 +2834,7 @@ def cmd_hub(a):
       lab-exp hub --out DIR [--max-mb 25] [--projects ROOT,...] [--intents URL]
           STATIC site: index + one DAG page per project + its reports copied beside it, ready for
           a publisher (the lab's `lab-exp-hub` wraps lab-report) -- the read-only phone view.
-      lab-exp hub --serve [--port N] [--bind 127.0.0.1] [--projects ROOT,...]
+      lab-exp hub --serve [--port N | --socket PATH] [--bind 127.0.0.1] [--projects ROOT,...]
           LIVE server: the same index and DAG pages re-rendered on every load, reports served from
           the projects, and the pages' supersede / important / note buttons writing straight
           through -- reach it from a laptop over an ssh tunnel.
@@ -2799,7 +2843,7 @@ def cmd_hub(a):
     if not roots:
         die("no lab-exp projects found (none registered in " + str(PROJECTS_TSV) + ", or pass --projects)")
     if a.serve:
-        return hub_serve(roots, a.port, a.bind, peer=a.peer)
+        return hub_serve(roots, a.port, a.bind, peer=a.peer, sock=a.socket)
     if not a.out:
         die("--out DIR (static site) or --serve (live server) is required")
     out = Path(a.out).resolve()
@@ -3643,6 +3687,8 @@ def main():
     s.add_argument("--serve", action="store_true", help="serve the hub live instead (writes go straight through)")
     s.add_argument("--port", type=int, default=0, help="port for --serve (default: ephemeral)")
     s.add_argument("--bind", default="127.0.0.1", help="interface for --serve (default localhost: reach it over an ssh tunnel)")
+    s.add_argument("--socket", default="", metavar="PATH", help="--serve on this unix socket instead of a port: only you can "
+                   "open it (its directory is kept 0700); tunnel with ssh -L PORT:PATH")
     s.add_argument("--peer", default="", metavar="URL", help="--serve: the other machine's live hub as the browser reaches it "
                    "(e.g. http://localhost:8791); /x/<id> links for experiments not here go on to it")
     s.add_argument("--max-mb", default=25, help="reports above this size become a pointer page (default 25)")
