@@ -102,6 +102,8 @@ project/
    CSV/TSV files at the same depths (out/ top level or one folder down) open as sortable tables
    in the LIVE hub only (the published hub never ships raw data files); big files show their first
    5,000 rows, with the raw file one click away. A table is not a report: say what it shows in one.
+   Figures in out/ (PNG, JPEG, GIF, SVG, WebP, PDF) likewise show in the LIVE hub only: thumbnails
+   in the panel, and a gallery of everything up to three folders down with a full-size viewer.
    Reproduce an old experiment at its recorded SHA via `git worktree`.
    **Working in a git worktree is fine**: the hub, the live hub and the vault notes read the
    project across all its worktrees (one copy per id, the most advanced status; reports from
