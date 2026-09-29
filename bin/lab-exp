@@ -1807,7 +1807,7 @@ def hub_favicon():
     return _dag_module().FAVICON
 
 
-def dag_html(root, live=False, intents=""):
+def dag_html(root, live=False, intents="", home=""):
     rows, parents, _children = graph_maps(root)
     nodes = []
     for eid, r in rows.items():
@@ -1852,6 +1852,9 @@ def dag_html(root, live=False, intents=""):
             "figs": figs, "figs_n": figs_n})
     payload = {
         "project": load_cfg(root)["project"].get("name") or root.name,
+        # live only: the project's registered checkout, for the panel's follow-up question (the
+        # lab console launches an orchestrator there); `root` here is a temporary view
+        "home": home if live else "",
         "nodes": sorted(nodes, key=lambda n: n["id"]),
         "edges": [{"child": c, "parent": p} for c, ps in parents.items() for p in ps],
     }
@@ -2270,7 +2273,7 @@ def make_live_handler(slugmap, index_html=None, peer=""):
                     self._send(404, "no such report", "text/plain")
                 return
             with project_view(root) as view:
-                page = dag_html(view, live=True)
+                page = dag_html(view, live=True, home=str(root))
             self._send(200, page, "text/html; charset=utf-8")
 
         def do_POST(self):

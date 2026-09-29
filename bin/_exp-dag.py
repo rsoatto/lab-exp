@@ -112,6 +112,9 @@ __FAVICON__
  .noteform .row { display:flex; gap:.5rem; align-items:center; margin-top:.35rem; }
  .noteform .row .meta { margin:0; }
  .queued-tag { color:var(--running); font-size:.78rem; }
+ #fq { width:100%; min-height:4.5rem; font:inherit; font-size:.88rem; padding:.45rem .6rem; border:1px solid var(--line);
+   border-radius:7px; background:var(--bg); color:inherit; resize:vertical; }
+ #fq-msg { font-size:.8rem; color:var(--mut); margin:.3rem 0 0; }
  .md { border-top:1px solid var(--line); padding-top:.9rem; }
  .md h1,.md h2,.md h3 { font-size:.98rem; margin:1.1rem 0 .35rem; }
  .md h1:first-child,.md h2:first-child { margin-top:0; }
@@ -719,6 +722,10 @@ function select(id) {
             title="${esc(f)}"><img loading="lazy" alt="" src="img/${encodeURIComponent(id)}/${f.split("/").map(encodeURIComponent).join("/")}"></a>`).join("")}
       <a class="all" href="figures/${encodeURIComponent(id)}" target="_blank">▣ all figures</a></div>` : ""}
     ${notesHtml(id, n)}
+    ${LIVE && DATA.home ? `<div class="sec"><div class="head"><h3>Ask a follow-up</h3></div>
+      <textarea id="fq" placeholder="A question about this experiment. The lab console opens with an orchestrator ready to answer it, for you to check and start."></textarea>
+      <div class="actions" style="margin-bottom:0"><button id="btn-fq">set up a follow-up orchestrator…</button></div>
+      <p id="fq-msg"></p></div>` : ""}
     <div class="sec"><div class="head"><h3>Orchestrator summary</h3></div>
       ${n.finding ? `<p style="font-size:.9rem;margin:.2rem 0">${esc(n.finding)}</p>` : `<div class="empty">no finding recorded yet</div>`}</div>
     <div class="chips">${tagsOf(n).map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div>
@@ -728,6 +735,7 @@ function select(id) {
   side.querySelectorAll("[data-go]").forEach(a =>
     a.addEventListener("click", ev => { ev.preventDefault(); select(a.dataset.go); }));
   const on = (bid, fn) => { const b = document.getElementById(bid); if (b) b.addEventListener("click", fn); };
+  on("btn-fq", () => followUp(id, n));
   on("btn-sup",    () => { setPicking({ old: id }); select(id); });
   on("btn-cancel", () => { setPicking(null); select(id); });
   on("btn-nosucc", () => doSupersede(id, ""));
@@ -748,6 +756,23 @@ function select(id) {
 
 /* ---- notes UI: the user's markdown block, read anywhere, edited whole where writes are possible -- */
 let noteEdit = null;      // id of the node whose notes are open in the editor
+// A follow-up question goes to the lab console on this laptop, which pre-fills its New orchestrator
+// form (dir, name, a brief with this experiment's context) for Renzo to check and start. The hub
+// itself never launches anything: its servers listen on shared boxes, where any user could reach
+// a launch endpoint. The console holds the launch key in its own page.
+const CONSOLE = "http://127.0.0.1:8797/";
+async function followUp(id, n) {
+  const q = (document.getElementById("fq").value || "").trim();
+  const msg = document.getElementById("fq-msg");
+  if (!q) { msg.textContent = "Write the question first."; return; }
+  try { await fetch(CONSOLE + "api/ping", { mode: "no-cors", cache: "no-store" }); }
+  catch (e) { msg.textContent = "The lab console isn't running on this laptop. Run lab-console (or lab-hub up), then try again."; return; }
+  const p = new URLSearchParams({ followup: id, project: DATA.project || "", root: DATA.home,
+    status: n.status || "", finding: n.finding || "", q });
+  window.open(CONSOLE + "?" + p.toString(), "_blank");
+  msg.textContent = "Opened in the lab console: check the form there and press Start.";
+}
+
 function notesHtml(id, n) {
   const body = notesSplit(n.readme || "").body;
   const queued = PENDING.some(p => p.op === "note" && p.id === id);

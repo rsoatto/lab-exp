@@ -473,7 +473,9 @@ class LabExpTests(unittest.TestCase):
         (out / "atlas" / "tiles" / "t" / "deep.png").write_bytes(png)       # 3 folders down: gallery only
         (out / "notes.txt").write_text("not a figure")
         mod = self._mod()
-        self.assertNotIn("loss.png", mod.dag_html(self.p.root))                      # the published page: never
+        static = mod.dag_html(self.p.root)
+        self.assertNotIn("loss.png", static)                                          # the published page: never
+        self.assertIn('"home": ""', static)                                           # ...nor a follow-up box
         srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -486,6 +488,7 @@ class LabExpTests(unittest.TestCase):
                     return e.code, b"", {}
             page = get("/proj/")[1].decode()
             self.assertIn('"figs": ["loss.png", "sub/umap one.svg"], "figs_n": 2', page)
+            self.assertRegex(page, r'"home": "/[^"]*/proj"')                          # the follow-up box's target
             code, body, hdr = get(f"/proj/img/{a}/loss.png")
             self.assertEqual((code, body, hdr["Content-Type"]), (200, png, "image/png"))
             code, body, hdr = get(f"/proj/img/{a}/sub/umap%20one.svg")
