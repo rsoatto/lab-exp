@@ -153,6 +153,10 @@ __FAVICON__
  .band-label { font-size:11px; fill:var(--mut); letter-spacing:.02em; }
  .bands { transition: opacity .35s ease; }
  .actions { display:flex; gap:.5rem; margin:.2rem 0 .9rem; }
+ .figs { display:grid; grid-template-columns:repeat(3, 1fr); gap:.35rem; margin:.2rem 0 .9rem; }
+ .figs a.fig { display:block; border:1px solid var(--line); border-radius:6px; overflow:hidden; background:#fff; }
+ .figs a.fig img { display:block; width:100%; height:72px; object-fit:contain; }
+ .figs a.all { grid-column:1 / -1; font-size:.85rem; }
  .actions button { font:inherit; font-size:.8rem; padding:.3rem .7rem; border-radius:7px;
    border:1px solid var(--line); background:var(--bg); color:inherit; cursor:pointer; }
  .actions button:hover { border-color:var(--mut); }
@@ -710,6 +714,10 @@ function select(id) {
     ${LIVE && (n.data || []).length ? `<div class="actions" style="flex-wrap:wrap">${n.data.map(dp =>
         `<a href="data/${encodeURIComponent(id)}/${dp.split("/").map(encodeURIComponent).join("/")}" target="_blank"
             style="font-size:.85rem" title="open as a table">▦ ${esc(dp)}</a>`).join("")}</div>` : ""}
+    ${LIVE && n.figs_n ? `<div class="figs">${(n.figs || []).filter(f => !/\.pdf$/i.test(f)).map(f =>
+        `<a class="fig" href="img/${encodeURIComponent(id)}/${f.split("/").map(encodeURIComponent).join("/")}" target="_blank"
+            title="${esc(f)}"><img loading="lazy" alt="" src="img/${encodeURIComponent(id)}/${f.split("/").map(encodeURIComponent).join("/")}"></a>`).join("")}
+      <a class="all" href="figures/${encodeURIComponent(id)}" target="_blank">▣ all figures</a></div>` : ""}
     ${notesHtml(id, n)}
     <div class="sec"><div class="head"><h3>Orchestrator summary</h3></div>
       ${n.finding ? `<p style="font-size:.9rem;margin:.2rem 0">${esc(n.finding)}</p>` : `<div class="empty">no finding recorded yet</div>`}</div>

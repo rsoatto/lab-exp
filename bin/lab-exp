@@ -1832,15 +1832,24 @@ def dag_html(root, live=False, intents=""):
         # Tables (CSV/TSV) at the same depths, LIVE pages only: the live server renders them as a
         # table (/data/<id>/<rel>); the published hub is a public site that encrypts only its HTML,
         # so a raw data file must never ride along there.
-        data = []
+        data, figs, figs_n = [], [], 0
         if live:
             try:
                 data = sorted(q.relative_to(outd).as_posix() for pat in ("*.csv", "*.tsv", "*/*.csv", "*/*.tsv")
                               for q in outd.glob(pat))[:30]
             except OSError:
                 data = []
+            # Figures at the same two depths, for the panel's thumbnails and its gallery link; the
+            # gallery page itself (/figures/<id>) looks one level deeper, on request only.
+            try:
+                found = sorted(q.relative_to(outd).as_posix() for pat in ("*", "*/*") for q in outd.glob(pat)
+                               if q.suffix.lower() in IMG_TYPES)
+                figs, figs_n = found[:6], len(found)
+            except OSError:
+                pass
         nodes.append({k: r.get(k, "") for k in REG_COLS} | {
-            "dir": f"experiments/{eid}", "readme": readme, "reports": reps, "data": data})
+            "dir": f"experiments/{eid}", "readme": readme, "reports": reps, "data": data,
+            "figs": figs, "figs_n": figs_n})
     payload = {
         "project": load_cfg(root)["project"].get("name") or root.name,
         "nodes": sorted(nodes, key=lambda n: n["id"]),
@@ -1979,6 +1988,133 @@ head(); body();
 """
 
 
+# Figures the live hub shows: the panel's thumbnails, /img/<id>/<rel> (the file) and the gallery
+# /figures/<id>. Live only, like tables: the published hub is public and encrypts only its HTML.
+IMG_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+             ".svg": "image/svg+xml", ".webp": "image/webp", ".pdf": "application/pdf"}
+FIG_MAX = 600          # figures one gallery page shows (FUS's atlas experiment holds ~4,000 tiles)
+FIG_DEPTH = 3          # folders below out/ the gallery looks into
+FIG_SCAN_MAX = 50000   # directory entries it will read before giving up, whatever it has found
+
+
+def out_file(root, eid, rel, suffixes):
+    """(view entry, path) for `rel` under experiment `eid`'s out/, in the checkout the page showed.
+    `rel` comes off the wire, so it is confined LEXICALLY (no .. segments, not absolute) and must
+    have one of `suffixes`. Deliberately NOT a resolved-prefix check: out/ routinely holds symlinks
+    to the experiment's own artifacts on other volumes (IterativeResiduals links results/ ->
+    /ewsc), and those are what the routes exist to serve. Raises ValueError."""
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        raise ValueError("bad path")
+    e = view_entry(root, eid)
+    if e["out"] is None:
+        raise ValueError("no out/")
+    f = e["out"] / rel
+    if not (f.suffix.lower() in suffixes and f.is_file()):
+        raise ValueError("no such file")
+    return e, f
+
+
+def list_figures(outd):
+    """(figures, total, truncated): image paths under out/ up to FIG_DEPTH folders down, sorted, the
+    first FIG_MAX of them. Follows symlinked folders (see out_file) but never enters one twice."""
+    found, seen, scanned, truncated = [], set(), 0, False
+    for cur, dirs, files in os.walk(outd, followlinks=True):
+        real = os.path.realpath(cur)
+        rel_dir = os.path.relpath(cur, outd)
+        depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+        if real in seen or depth > FIG_DEPTH:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        scanned += len(dirs) + len(files)
+        found += [os.path.normpath(os.path.join(rel_dir, f)).replace(os.sep, "/") for f in files
+                  if os.path.splitext(f)[1].lower() in IMG_TYPES]
+        if scanned > FIG_SCAN_MAX:
+            truncated = True
+            break
+        dirs.sort()
+    found.sort()
+    return found[:FIG_MAX], len(found), truncated
+
+
+def figures_html(eid, figs, total, truncated):
+    from urllib.parse import quote
+    groups = {}
+    for f in figs:
+        groups.setdefault(f.rsplit("/", 1)[0] if "/" in f else "", []).append(f)
+    src = lambda f: "../img/" + quote(eid) + "/" + "/".join(quote(x) for x in f.split("/"))
+    body = []
+    for folder, fs in groups.items():
+        cards = "".join(
+            (f'<a class="card img" href="{src(f)}"><img loading="lazy" src="{src(f)}" alt=""><span>{_html.escape(f.rsplit("/", 1)[-1])}</span></a>'
+             if not f.lower().endswith(".pdf") else
+             f'<a class="card pdf" href="{src(f)}" target="_blank"><b>PDF</b><span>{_html.escape(f.rsplit("/", 1)[-1])}</span></a>')
+            for f in fs)
+        body.append(f'<h2>{_html.escape(folder + "/") if folder else "out/"}<small>{len(fs)}</small></h2><div class="grid">{cards}</div>')
+    note = (f"the first {len(figs)} of {total}" if total > len(figs) else f"{total}") + (" (stopped reading folders early)" if truncated else "")
+    return (FIG_PAGE.replace("__TITLE__", _html.escape(f"figures · {eid}")).replace("__FAVICON__", hub_favicon())
+            .replace("__EID__", _html.escape(eid)).replace("__BACK__", "../?id=" + quote(eid))
+            .replace("__NOTE__", _html.escape(note)).replace("__BODY__", "".join(body) or "<p class=mut>No figures in out/.</p>")
+            .replace("__SRCS__", json.dumps([src(f) for f in figs if not f.lower().endswith(".pdf")]).replace("</", "<\\/")))
+
+
+FIG_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+__FAVICON__
+<style>
+:root { --bg:#fff; --fg:#1b1b1b; --mut:#6b6b6b; --line:#e3e3e3; --card:#fafaf8; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161616; --fg:#e8e8e8; --mut:#9a9a9a; --line:#2d2d2d; --card:#1f1f1f; } }
+body { margin:0; font:13px/1.4 -apple-system,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+header { position:sticky; top:0; z-index:2; background:var(--bg); padding:10px 16px; border-bottom:1px solid var(--line);
+  display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+h1 { font-size:14px; margin:0; font-weight:600; } .mut { color:var(--mut); } a { color:inherit; }
+main { padding:6px 16px 40px; }
+h2 { font-size:13px; font-weight:600; margin:18px 0 8px; } h2 small { color:var(--mut); font-weight:400; margin-left:6px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:10px; }
+.card { display:flex; flex-direction:column; gap:4px; text-decoration:none; background:var(--card);
+  border:1px solid var(--line); border-radius:8px; padding:6px; min-width:0; }
+.card img { width:100%; height:150px; object-fit:contain; background:#fff; border-radius:4px; }
+.card span { font-size:11.5px; color:var(--mut); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.card.pdf b { height:150px; display:grid; place-items:center; color:var(--mut); }
+.card:hover { border-color:var(--mut); }
+#lb { position:fixed; inset:0; background:rgba(0,0,0,.88); display:none; z-index:9; }
+#lb.on { display:grid; grid-template-rows:auto 1fr; }
+#lb .bar { display:flex; gap:14px; padding:10px 16px; color:#ddd; font-size:13px; align-items:center; }
+#lb .bar a { color:#9cf; } #lb .bar .x { margin-left:auto; cursor:pointer; font-size:18px; }
+#lb img { max-width:100%; max-height:100%; object-fit:contain; margin:auto; background:#fff; }
+#lb .stage { display:grid; place-items:center; min-height:0; padding:0 16px 16px; }
+</style>
+<header><h1>Figures</h1><span class="mut">__EID__ · __NOTE__ · <a href="__BACK__">back to the graph</a></span></header>
+<main>__BODY__</main>
+<div id="lb"><div class="bar"><span id="lbname"></span><span class="mut" id="lbpos"></span><a id="lbopen" target="_blank">open the file</a>
+  <span class="mut">← → to move, Esc to close</span><span class="x" id="lbx">✕</span></div><div class="stage"><img id="lbimg" alt=""></div></div>
+<script>
+const SRCS = __SRCS__;
+let at = -1;
+const lb = document.getElementById("lb"), img = document.getElementById("lbimg");
+function show(i) {
+  at = (i + SRCS.length) % SRCS.length; img.src = SRCS[at];
+  document.getElementById("lbopen").href = SRCS[at];
+  document.getElementById("lbname").textContent = decodeURIComponent(SRCS[at].split("/").slice(3).join("/"));
+  document.getElementById("lbpos").textContent = (at + 1) + " of " + SRCS.length;
+  lb.classList.add("on");
+}
+document.querySelectorAll(".card.img").forEach(a => a.addEventListener("click", ev => {
+  if (ev.metaKey || ev.ctrlKey) return;
+  ev.preventDefault(); show(SRCS.indexOf(a.getAttribute("href")));
+}));
+document.getElementById("lbx").onclick = () => lb.classList.remove("on");
+lb.addEventListener("click", ev => { if (ev.target === lb || ev.target.classList.contains("stage")) lb.classList.remove("on"); });
+document.addEventListener("keydown", ev => {
+  if (!lb.classList.contains("on")) return;
+  if (ev.key === "Escape") lb.classList.remove("on");
+  if (ev.key === "ArrowRight") show(at + 1);
+  if (ev.key === "ArrowLeft") show(at - 1);
+});
+</script>
+"""
+
+
 def find_experiments(slugmap, text):
     """[(slug, id)] for an experiment named by `text` across the projects in `slugmap`: exact
     directory names first, else ids ending in "-<text>" (the slug without its date), else ids
@@ -2076,14 +2212,7 @@ def make_live_handler(slugmap, index_html=None, peer=""):
                 # Same lexical confinement as /report/ below; the owner's copy via the worktree view.
                 try:
                     eid, _, rel = rest[len("/data/"):].partition("/")
-                    if not rel or rel.startswith("/") or ".." in rel.split("/"):
-                        raise ValueError("bad path")
-                    e = view_entry(root, eid)
-                    if e["out"] is None:
-                        raise ValueError("no data")
-                    f = e["out"] / rel
-                    if not (f.suffix.lower() in (".csv", ".tsv") and f.is_file()):
-                        raise ValueError("not a table")
+                    e, f = out_file(root, eid, rel, (".csv", ".tsv"))
                     if "raw=1" in (self.path.split("?", 1)[1] if "?" in self.path else ""):
                         self.send_response(200)
                         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -2098,6 +2227,33 @@ def make_live_handler(slugmap, index_html=None, peer=""):
                     return
                 self._send(200, page, "text/html; charset=utf-8")
                 return
+            if rest.startswith("/img/"):
+                # /img/<eid>/<relpath under out/>: one figure, as itself. An SVG could carry script,
+                # so every figure goes out under a policy that runs none.
+                try:
+                    eid, _, rel = rest[len("/img/"):].partition("/")
+                    _e, f = out_file(root, eid, rel, IMG_TYPES)
+                    self.send_response(200)
+                    self.send_header("Content-Type", IMG_TYPES[f.suffix.lower()])
+                    self.send_header("Content-Length", str(f.stat().st_size))
+                    self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:")
+                    self.send_header("Cache-Control", "max-age=60")
+                    self.end_headers()
+                    with open(f, "rb") as fh:
+                        shutil.copyfileobj(fh, self.wfile, 1 << 20)
+                except (Exception, SystemExit):
+                    self._send(404, "no such figure", "text/plain")
+                return
+            if rest.startswith("/figures/"):
+                try:
+                    e = view_entry(root, rest[len("/figures/"):].strip("/"))
+                    figs, total, truncated = list_figures(e["out"]) if e["out"] is not None else ([], 0, False)
+                    page = figures_html(e["id"], figs, total, truncated)
+                except (Exception, SystemExit):
+                    self._send(404, "no such experiment", "text/plain")
+                    return
+                self._send(200, page, "text/html; charset=utf-8")
+                return
             if rest.startswith("/report/"):
                 # /report/<eid>/<relpath under out/>. Both segments come off the wire: the eid
                 # resolves through exp_dir (validates existence); the relpath is confined
@@ -2108,14 +2264,7 @@ def make_live_handler(slugmap, index_html=None, peer=""):
                 # is the owner's localhost tool; symlinks inside out/ are the owner's.
                 try:
                     eid, _, rel = rest[len("/report/"):].partition("/")
-                    if not rel or rel.startswith("/") or ".." in rel.split("/"):
-                        raise ValueError("bad path")
-                    e = view_entry(root, eid)          # the copy the page showed, reports from any checkout
-                    if e["out"] is None:
-                        raise ValueError("no reports")
-                    f = e["out"] / rel
-                    if not (f.suffix == ".html" and f.is_file()):
-                        raise ValueError("not a report")
+                    _e, f = out_file(root, eid, rel, (".html",))     # the copy the page showed, any checkout
                     self._send(200, f.read_text(errors="replace"), "text/html; charset=utf-8")
                 except (Exception, SystemExit):
                     self._send(404, "no such report", "text/plain")

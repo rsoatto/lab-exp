@@ -458,6 +458,54 @@ class LabExpTests(unittest.TestCase):
         self.assertIn('P.get("id")', page)
         self.assertIn('"../x/" : "?id="', page)                                            # the panel's link
 
+    def test_live_hub_shows_figures_and_never_lists_them_on_static_pages(self):
+        import threading
+        import urllib.request
+        self.p.init()
+        a = self.p.new("figs")
+        out = self.p.root / "experiments" / a / "out"
+        (out / "sub").mkdir(parents=True)
+        (out / "atlas" / "tiles" / "t").mkdir(parents=True)
+        png = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                            "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
+        (out / "loss.png").write_bytes(png)
+        (out / "sub" / "umap one.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+        (out / "atlas" / "tiles" / "t" / "deep.png").write_bytes(png)       # 3 folders down: gallery only
+        (out / "notes.txt").write_text("not a figure")
+        mod = self._mod()
+        self.assertNotIn("loss.png", mod.dag_html(self.p.root))                      # the published page: never
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def get(path):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}") as r:
+                        return r.status, r.read(), dict(r.headers)
+                except urllib.error.HTTPError as e:
+                    return e.code, b"", {}
+            page = get("/proj/")[1].decode()
+            self.assertIn('"figs": ["loss.png", "sub/umap one.svg"], "figs_n": 2', page)
+            code, body, hdr = get(f"/proj/img/{a}/loss.png")
+            self.assertEqual((code, body, hdr["Content-Type"]), (200, png, "image/png"))
+            code, body, hdr = get(f"/proj/img/{a}/sub/umap%20one.svg")
+            self.assertEqual((code, hdr["Content-Type"]), (200, "image/svg+xml"))
+            self.assertIn("default-src 'none'", hdr["Content-Security-Policy"])      # its script never runs
+            for bad in (f"/proj/img/{a}/notes.txt", f"/proj/img/{a}/../README.md", f"/proj/img/{a}/nope.png",
+                        "/proj/img/no-such-exp/loss.png", "/proj/figures/no-such-exp"):
+                self.assertEqual(get(bad)[0], 404, bad)
+            code, gal, _ = get(f"/proj/figures/{a}")
+            gal = gal.decode()
+            self.assertEqual(code, 200)
+            for f in ("loss.png", "sub/umap%20one.svg", "atlas/tiles/t/deep.png"):
+                self.assertIn(f"../img/{a}/{f}", gal)
+            self.assertIn(f'<img loading="lazy" src="../img/{a}/sub/umap%20one.svg"', gal)  # a thumbnail, not a bare link
+            self.assertIn('<link rel="icon" href="data:image/svg+xml,', gal)
+            mod.FIG_MAX = 1
+            self.assertIn("the first 1 of 3", get(f"/proj/figures/{a}")[1].decode())
+        finally:
+            srv.shutdown(); srv.server_close()
+
     def test_live_hub_renders_csv_tables_and_never_lists_them_on_static_pages(self):
         import threading
         import urllib.request
