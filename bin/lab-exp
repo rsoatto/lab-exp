@@ -12,6 +12,7 @@ process, so projects never import this framework and `python run.py` always work
   lab-exp run <ID> [--gpus N] [--time T] [--partition P] [--dry-run] [-- args...]
   lab-exp done <ID> [--status done|failed|abandoned] [--finding "..."] [--metrics k=v,..]
   lab-exp list [--kind K] [--tag k:v] [--status S]
+  lab-exp search "QUERY" [--project P] [--kind K] [--status S] [--since D] [--json]
   lab-exp viz <ID> [<name>]           # list / run applicable visualizers -> out/viz/
   lab-exp serve <name> <ID...> | serve --list | serve --stop <port>
   lab-exp index                       # regenerate <pkg>/INDEX.md (methods + visualizers)
@@ -36,6 +37,7 @@ import re
 import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -59,6 +61,17 @@ WANDB_ENV = Path.home() / ".config" / "lab" / "wandb.env"
 # token, not an mtime: the fleet's clocks disagree by up to an hour, and on the NFS home this
 # one file is shared by every box.
 HUB_DIRTY = Path.home() / ".config" / "lab" / "hub.dirty"
+# `lab-exp search`'s index: a cache derived from the READMEs (rebuilt by deleting it), under ~/.cache
+# so it is never inside a repository. On the fleet's NFS home one index serves every box.
+SEARCH_DB = Path.home() / ".cache" / "lab" / "exp-search.db"
+# The embedding model, the one search setting. Vectors are stored per model, so changing it re-embeds
+# instead of mixing two vector spaces. litmap's own model, until a comparison says otherwise.
+EMBED_MODEL = os.environ.get("LAB_EXP_EMBED_MODEL") or "Alibaba-NLP/gte-modernbert-base"
+# The model runs in litmap's environment (torch + sentence-transformers), found the way the `litmap`
+# wrapper finds it; lab-exp itself stays standard-library only. LAB_EXP_EMBED_PYTHON points at
+# another interpreter (tests; trying a model litmap's environment cannot load).
+LITMAP_RUNTIME = Path(os.environ.get("LITMAP_RUNTIME") or "/ewsc/rsoatto/litmap-runtime")
+EMBED_PYTHON = os.environ.get("LAB_EXP_EMBED_PYTHON") or str(LITMAP_RUNTIME / "kb-venv" / "bin" / "python")
 
 
 # ---------------------------------------------------------------- config
@@ -2141,14 +2154,83 @@ def _goto_page(title, body):
             f"padding:24px;max-width:760px'>{body}<p><a href='/'>all projects</a></p></body>")
 
 
-def make_live_handler(slugmap, index_html=None, peer=""):
+class HubSearch:
+    """`lab-exp search` behind the live hub's filter box: one embedding worker kept warm for the life of
+    the server, the index refreshed for the project being searched (at most every REFRESH seconds:
+    a refresh re-stats its READMEs, ~2 s for 450 experiments on NFS). Every call serializes on one
+    lock; a search that finds it held -- the first-run embedding pass, or another search -- answers
+    from the keyword index alone rather than wait, and says so."""
+    REFRESH = 15
+    LIMIT = 20
+
+    def __init__(self):
+        import threading
+        self.lock = threading.Lock()
+        self.emb, self.note, self.fresh = Embedder(), "", {}
+
+    def _prepare(self, roots):
+        """Refresh `roots` (when stale) and embed what changed. Call with the lock held."""
+        con = search_db()
+        try:
+            stale = [r for r in roots if time.time() - self.fresh.get(r, 0) > self.REFRESH]
+            if stale:
+                search_refresh(con, stale)
+                self.fresh.update({r: time.time() for r in stale})
+            if self.emb is not None:
+                try:
+                    self.emb.load()
+                    search_embed(con, self.emb)
+                except EmbedError as e:
+                    self.emb, self.note = None, f"keyword-only search: {e}"
+        finally:
+            con.close()
+
+    def warm(self, roots):
+        """Load the model and index `roots` in the background (the server calls this at startup, so the
+        first search does not pay the model load or the first-run embedding pass)."""
+        import threading
+
+        def run():
+            with self.lock:
+                self._prepare(roots)
+        threading.Thread(target=run, daemon=True).start()
+
+    def query(self, root, text):
+        """{"ids": ranked experiment ids of `root`'s project, "mode", "note"}."""
+        proj = [project_name(root)]
+        if not self.lock.acquire(timeout=2):
+            con = search_db()
+            try:
+                ids = [r["id"] for r in search_index(con, text, proj, None, self.LIMIT)]
+            finally:
+                con.close()
+            return {"ids": ids, "mode": "keyword", "note": "keyword-only for now: semantic search is still indexing"}
+        try:
+            self._prepare([root])
+            con = search_db()
+            try:
+                try:
+                    res = search_index(con, text, proj, self.emb, self.LIMIT)
+                except EmbedError as e:
+                    self.emb, self.note = None, f"keyword-only search: {e}"
+                    res = search_index(con, text, proj, None, self.LIMIT)
+            finally:
+                con.close()
+        finally:
+            self.lock.release()
+        return {"ids": [r["id"] for r in res], "mode": "keyword" if self.emb is None else "hybrid", "note": self.note}
+
+
+def make_live_handler(slugmap, index_html=None, peer="", searcher=None):
     """The request handler behind both live servers. `slugmap` maps a URL prefix to a project
     root: {"": root} serves one project at /, {slug: root, ...} serves a hub at / with each
     project under /<slug>/. Every GET re-renders from the registry; the page's buttons POST back
     to <prefix>/{supersede,undo,important,note} with the same locked writes as the CLI.
     /x/<experiment id> finds the experiment in whichever project holds it and redirects to its
     node (<prefix>/?id=<id>); an id this server doesn't have goes on to `peer` (the other
-    machine's live hub, as the browser reaches it) once, so one link works for either site."""
+    machine's live hub, as the browser reaches it) once, so one link works for either site.
+    With a `searcher` (HubSearch), <prefix>/search?q=TEXT answers the page's filter box with the
+    ranked ids of that project's experiments."""
     from http.server import BaseHTTPRequestHandler
     from urllib.parse import unquote, quote, parse_qs
 
@@ -2210,6 +2292,13 @@ def make_live_handler(slugmap, index_html=None, peer=""):
             if prefix and not self.path.split("?", 1)[0].startswith("/" + prefix + "/"):
                 # /<slug> -> /<slug>/ so the page's relative api and report links resolve inside it
                 self._send(301, "", "text/plain", {"Location": "/" + prefix + "/" + (("?" + self.path.split("?", 1)[1]) if "?" in self.path else "")}); return
+            if rest == "/search" and searcher is not None:
+                text = (parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}).get("q", [""])[0].strip()
+                try:
+                    out = searcher.query(root, text) if text else {"ids": [], "mode": "", "note": ""}
+                except Exception as e:            # the filter box falls back to its substring match
+                    self._send(500, json.dumps({"error": str(e)}), "application/json"); return
+                self._send(200, json.dumps(out), "application/json"); return
             if rest.startswith("/data/"):
                 # /data/<eid>/<relpath under out/>: a CSV/TSV as a table page (?raw=1: the file itself).
                 # Same lexical confinement as /report/ below; the owner's copy via the worktree view.
@@ -2361,7 +2450,10 @@ def hub_serve(roots, port, bind="127.0.0.1", block=True, peer="", sock=""):
     slugmap = {}
     for root in roots:
         slugmap[hub_slug(load_cfg(root)["project"].get("name") or root.name)] = root
-    handler = make_live_handler(slugmap, lambda: hub_index_html(roots, live=True), peer)
+    searcher = HubSearch()
+    handler = make_live_handler(slugmap, lambda: hub_index_html(roots, live=True), peer, searcher)
+    if block:
+        searcher.warm(roots)
     if sock:
         class UnixHub(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             daemon_threads = True
@@ -2571,6 +2663,353 @@ def cmd_materialize(a):
     if str(meta.get("backfilled", "")).lower() in ("true", "1", "yes"):
         print("  note: README still marked `backfilled: true`; out/ is now real copies, not "
               "symlinks — the flag is harmless but you may drop it if this is no longer a backfill.")
+
+
+# ---------------------------------------------------------------- search
+# Every experiment on this machine, ranked against a query two ways and merged: SQLite FTS5 (BM25)
+# catches exact tokens -- ids, gene names, metric names, "500k" -- and embedding similarity catches
+# rephrasings. The two rankings merge by reciprocal rank fusion (each list contributes
+# 1/(RRF_K + rank)), which needs no score calibration between BM25 and cosine. The index is a cache:
+# each search re-reads only the experiments whose README, metrics.json or registry row changed.
+
+SEARCH_VERSION = "1"        # bump when search_doc changes what is indexed: every entry is rebuilt
+EMBED_CHARS = 2000          # text per experiment handed to the model: title, finding, tags, then the README
+                            # body (the hypothesis, usually). Longer costs ~1.2 s an experiment on CPU, not 0.5;
+                            # the keyword index has the whole README.
+RRF_K = 60                  # the usual constant: damps the head of each list so neither one dominates
+# Function words dropped from keyword queries: written as a sentence ("runs where we knocked down
+# LMNA"), a query would otherwise OR in words every README contains and drown the one that matters.
+STOPWORDS = set("a an and any are as at be by did do does for from had has have how i in into is it its "
+                "me my of on or our show that the their them then there these this those to tried use used "
+                "using was we were what when where which who why will with".split())
+
+SEARCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS docs (key TEXT PRIMARY KEY, project TEXT, id TEXT, dir TEXT, kind TEXT,
+    status TEXT, date TEXT, title TEXT, finding TEXT, tags TEXT, metrics TEXT, stamp TEXT,
+    etext TEXT, ehash TEXT);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(key UNINDEXED, id, title, finding, tags, kind,
+    status, metrics, body, tokenize='porter unicode61');
+CREATE TABLE IF NOT EXISTS vecs (key TEXT, model TEXT, hash TEXT, vec BLOB, PRIMARY KEY (key, model));
+"""
+# bm25() weights, one per fts column in order (key is unindexed): a word in the id or title says more
+# about an experiment than the same word somewhere in its README.
+BM25_WEIGHTS = "0, 8, 6, 4, 4, 2, 1, 2, 1"
+
+
+def search_db():
+    SEARCH_DB.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(SEARCH_DB, timeout=60)
+    con.executescript(SEARCH_SCHEMA)
+    return con
+
+
+def _sig(p):
+    try:
+        st = p.stat()
+        return f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return "-"
+
+
+def search_doc(e):
+    """The indexed fields of one view entry (see view_index): registry facts from its row, the title
+    and body from its README with the front-matter and template comments stripped (every README
+    carries the same template comments, which would make all of them look alike to the model)."""
+    readme = e["dir"] / "README.md"
+    try:
+        txt = readme.read_text(errors="replace")
+    except OSError:
+        txt = ""
+    fm, r = read_front(readme), e["row"]
+    lines = txt.splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), 0)
+        lines = lines[end + 1:]
+    body = re.sub(r"<!--.*?-->", "", "\n".join(lines), flags=re.S).strip()
+    head = re.search(r"^# (.+)$", body, re.M)
+    title = fm.get("title") or (head[1].strip() if head else "") or e["id"]
+    finding = r.get("finding", "") or fm.get("finding", "")
+    tags = ", ".join(split_list(r.get("tags", "")))
+    etext = "\n".join(x for x in (title, finding, f"kind: {r.get('kind', '')}; tags: {tags}", body) if x)[:EMBED_CHARS]
+    return {"title": title, "finding": finding, "tags": tags, "body": body, "etext": etext}
+
+
+def search_refresh(con, roots):
+    """Bring the index up to date with the experiments of `roots` (each project's whole view, worktrees
+    included): rewrite the entries whose README, metrics.json or registry row changed, drop the ones
+    whose experiment is gone. Returns the number of entries rewritten."""
+    import hashlib
+    n = 0
+    for root in roots:
+        proj = project_name(root)
+        have = dict(con.execute("SELECT key, stamp FROM docs WHERE project = ?", (proj,)))
+        seen = set()
+        for eid, e in view_index(root).items():
+            key = f"{proj}/{eid}"
+            seen.add(key)
+            r = e["row"]
+            stamp = "|".join([SEARCH_VERSION, str(e["dir"]), _sig(e["dir"] / "README.md"),
+                              _sig(e["dir"] / "out" / "metrics.json"),
+                              hashlib.sha1("\t".join(r.get(c, "") for c in REG_COLS).encode()).hexdigest()])
+            if have.get(key) == stamp:
+                continue
+            d = search_doc(e)
+            ehash = hashlib.sha1(d["etext"].encode()).hexdigest()
+            con.execute("DELETE FROM fts WHERE key = ?", (key,))
+            con.execute("INSERT OR REPLACE INTO docs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (key, proj, eid, str(e["dir"]), r.get("kind", ""), r.get("status", ""), r.get("date", ""),
+                         d["title"], d["finding"], d["tags"], r.get("metrics", ""), stamp, d["etext"], ehash))
+            con.execute("INSERT INTO fts VALUES (?,?,?,?,?,?,?,?,?)",
+                        (key, eid, d["title"], d["finding"], d["tags"], r.get("kind", ""), r.get("status", ""),
+                         r.get("metrics", "").replace(",", " "), d["body"]))
+            n += 1
+        for key in set(have) - seen:
+            for t in ("docs", "fts", "vecs"):
+                con.execute(f"DELETE FROM {t} WHERE key = ?", (key,))
+        con.commit()
+    return n
+
+
+class EmbedError(Exception):
+    pass
+
+
+# Runs inside litmap's environment (EMBED_PYTHON -c EMBED_WORKER <model>): one JSON line in
+# ({"mode": "query"|"document", "texts": [...]}), one out ({"vecs": [base64 float32, ...]}), unit
+# vectors. encode_query/encode_document apply the model's own query and document prompts (none for
+# gte-modernbert; "task: search result | query: " and "title: none | text: " for EmbeddingGemma).
+EMBED_WORKER = r'''
+import base64, json, os, sys
+out = os.fdopen(os.dup(1), "w")
+os.dup2(2, 1)                     # library chatter goes to stderr; the pipe carries only replies
+import torch
+torch.set_num_threads(int(os.environ.get("LAB_EXP_EMBED_THREADS") or min(32, os.cpu_count() or 1)))
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer(sys.argv[1], device=os.environ.get("LAB_EXP_EMBED_DEVICE") or "cpu")
+print(json.dumps({"ready": True}), file=out, flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    enc = m.encode_query if req["mode"] == "query" else m.encode_document
+    v = enc(req["texts"], normalize_embeddings=True, batch_size=8, show_progress_bar=False, convert_to_numpy=True)
+    print(json.dumps({"vecs": [base64.b64encode(x.astype("float32").tobytes()).decode() for x in v]}), file=out, flush=True)
+'''
+
+
+class Embedder:
+    """litmap's environment as a vector service: one worker process, started on first use and kept
+    for the life of this object (the hub keeps one; a CLI search starts one per call, ~15 s cold).
+    Any failure raises EmbedError, which callers turn into a keyword-only search that says why.
+    Not thread-safe: the hub serializes its calls."""
+
+    def __init__(self, model=None, python=None):
+        self.model = model or EMBED_MODEL
+        self.python = python or EMBED_PYTHON
+        self.proc = self.log = None
+        self.ready = False
+
+    def start(self):
+        """Spawn the worker without waiting for its model to load (embed() waits)."""
+        if self.proc is not None:
+            return
+        if not os.access(self.python, os.X_OK):
+            raise EmbedError(f"litmap's environment is missing (no {self.python})")
+        env = dict(os.environ)
+        env.setdefault("HF_HOME", str(LITMAP_RUNTIME / "hf-cache"))
+        self.log = tempfile.TemporaryFile()
+        try:
+            self.proc = subprocess.Popen([self.python, "-c", EMBED_WORKER, self.model], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=self.log, text=True, env=env)
+        except OSError as e:
+            raise EmbedError(f"cannot start {self.python}: {e}")
+
+    def _reply(self):
+        line = self.proc.stdout.readline()
+        if not line:
+            self.log.seek(0)
+            tail = [l for l in self.log.read().decode(errors="replace").splitlines() if l.strip()][-1:]
+            self.close()
+            raise EmbedError(f"the embedding worker for {self.model} exited" + (f": {tail[0][:300]}" if tail else ""))
+        return json.loads(line)
+
+    def load(self):
+        """Start the worker and wait until its model is loaded."""
+        self.start()
+        if not self.ready:
+            self._reply()
+            self.ready = True
+
+    def embed(self, texts, mode):
+        """Unit vectors (bytes of float32) for `texts`, embedded as queries or as documents."""
+        self.load()
+        try:
+            self.proc.stdin.write(json.dumps({"mode": mode, "texts": list(texts)}) + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            self._reply()                 # the worker died: its reply is EOF, which raises with the reason
+        return [base64.b64decode(v) for v in self._reply()["vecs"]]
+
+    def close(self):
+        if self.proc is not None:
+            with contextlib.suppress(OSError):
+                self.proc.stdin.close()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.proc.wait(timeout=5)
+            if self.proc.poll() is None:
+                self.proc.kill()
+        self.proc, self.ready = None, False
+
+
+def search_embed(con, emb, progress=None):
+    """Embed every indexed entry whose text has no vector under emb.model yet, committing per batch so
+    an interrupted first run keeps what it did. progress(done, total) is called as batches finish."""
+    todo = con.execute("SELECT d.key, d.etext, d.ehash FROM docs d LEFT JOIN vecs v ON v.key = d.key AND v.model = ? "
+                       "WHERE v.hash IS NULL OR v.hash != d.ehash", (emb.model,)).fetchall()
+    for i in range(0, len(todo), 32):
+        batch = todo[i:i + 32]
+        vecs = emb.embed([t for _k, t, _h in batch], "document")
+        con.executemany("INSERT OR REPLACE INTO vecs VALUES (?,?,?,?)",
+                        [(k, emb.model, h, v) for (k, _t, h), v in zip(batch, vecs)])
+        con.commit()
+        if progress:
+            progress(i + len(batch), len(todo))
+    return len(todo)
+
+
+def fts_query(text):
+    """An FTS5 MATCH expression for free text: its words, minus STOPWORDS, each quoted (so no word is
+    read as FTS syntax) and OR-ed, so BM25 ranks experiments by how many rare words they share.
+    "" when nothing is left."""
+    words = [w for w in dict.fromkeys(re.findall(r"\w+", text.lower())) if w not in STOPWORDS]
+    return " OR ".join(f'"{w}"' for w in words)
+
+
+def rrf(rankings, k=RRF_K):
+    """Reciprocal rank fusion: {key: sum over rankings of 1 / (k + rank)}, rank counted from 1."""
+    out = {}
+    for ranking in rankings:
+        for i, key in enumerate(ranking, 1):
+            out[key] = out.get(key, 0.0) + 1.0 / (k + i)
+    return out
+
+
+def since_date(s):
+    """--since: YYYY-MM-DD as given, or Nd for the last N days."""
+    m = re.fullmatch(r"(\d+)d", s.strip())
+    if m:
+        return (date.today() - timedelta(days=int(m[1]) - 1)).isoformat()
+    try:
+        return date.fromisoformat(s.strip()).isoformat()
+    except ValueError:
+        raise ValueError(f"--since takes YYYY-MM-DD or Nd (days), not {s!r}")
+
+
+def search_index(con, query, projects, emb=None, limit=10, kind="", status="", since=""):
+    """Rank the indexed experiments of `projects` (names) against `query`. Each leg contributes its top
+    `limit` -- BM25 over the keyword index, cosine against the query's embedding when `emb` is given --
+    and the fused list is cut to `limit`. Rows: the docs fields plus score, keyword_rank, semantic_rank."""
+    from array import array
+    where, args = [f"d.project IN ({','.join('?' * len(projects))})"], list(projects)
+    for col, val in (("kind", kind), ("status", status)):
+        if val:
+            where.append(f"d.{col} = ?")
+            args.append(val)
+    if since:
+        where.append("d.date >= ?")
+        args.append(since_date(since))
+    cond = " AND ".join(where)
+    legs = []
+    expr = fts_query(query)
+    if expr:
+        legs.append([k for (k,) in con.execute(
+            f"SELECT d.key FROM fts JOIN docs d ON d.key = fts.key WHERE fts MATCH ? AND {cond} "
+            f"ORDER BY bm25(fts, {BM25_WEIGHTS}) LIMIT ?", [expr, *args, limit])])
+    else:
+        legs.append([])
+    if emb is not None:
+        qv = array("f", emb.embed([query], "query")[0])
+        sims = []
+        for key, blob in con.execute(f"SELECT d.key, v.vec FROM vecs v JOIN docs d ON d.key = v.key AND v.hash = d.ehash "
+                                     f"WHERE v.model = ? AND {cond}", [emb.model, *args]):
+            sims.append((sum(map(float.__mul__, qv, array("f", blob))), key))
+        legs.append([k for _s, k in sorted(sims, reverse=True)[:limit]])
+    scores = rrf(legs)
+    top = sorted(scores, key=lambda k: -scores[k])[:limit]
+    cols = ["key", "project", "id", "dir", "kind", "status", "date", "title", "finding", "tags", "metrics"]
+    rows = {r[0]: dict(zip(cols, r)) for r in con.execute(
+        f"SELECT {', '.join(cols)} FROM docs WHERE key IN ({','.join('?' * len(top))})", top)} if top else {}
+    out = []
+    for key in top:
+        r = rows[key]
+        r.pop("key")
+        r["score"] = round(scores[key], 5)
+        r["keyword_rank"] = legs[0].index(key) + 1 if key in legs[0] else None
+        r["semantic_rank"] = (legs[1].index(key) + 1 if key in legs[1] else None) if emb is not None else None
+        out.append(r)
+    return out
+
+
+def search_roots(project=""):
+    """The project roots a search covers: every registered project (else the one around the cwd),
+    narrowed to `project` -- its name, case-insensitive, or its root path."""
+    roots = project_roots()
+    if not roots:
+        here = Path.cwd().resolve()
+        roots = [d for d in [here, *here.parents] if (d / CONFIG_NAME).is_file()][:1]
+    if project:
+        roots = [r for r in roots if project_name(r).lower() == project.lower() or str(r) == str(Path(project).resolve())]
+        if not roots:
+            die(f"no lab-exp project named {project!r} on this machine (see `lab-exp projects`)")
+    if not roots:
+        die("no lab-exp projects on this machine (see `lab-exp projects`)")
+    return roots
+
+
+def cmd_search(a):
+    """lab-exp search "query" [--project P] [--kind K] [--status S] [--since YYYY-MM-DD|Nd] [--limit N] [--json]"""
+    roots = search_roots(a.project)
+    projects = [project_name(r) for r in roots]
+    emb, note = Embedder(), ""
+    try:
+        emb.start()                    # the model loads while the index refreshes
+    except EmbedError as e:
+        emb, note = None, f"keyword-only search: {e}"
+    con = search_db()
+    search_refresh(con, roots)
+    if emb is not None:
+        def progress(done, total):
+            if total > 32:
+                print(f"  embedding experiments for search: {done}/{total}", file=sys.stderr)
+        try:
+            search_embed(con, emb, progress)
+        except EmbedError as e:
+            emb, note = None, f"keyword-only search: {e}"
+    try:
+        try:
+            res = search_index(con, a.query, projects, emb, a.limit, a.kind, a.status, a.since)
+        except EmbedError as e:
+            note = f"keyword-only search: {e}"
+            res = search_index(con, a.query, projects, None, a.limit, a.kind, a.status, a.since)
+    except ValueError as e:
+        die(str(e))
+    finally:
+        if emb is not None:
+            emb.close()
+    mode = "keyword" if note else "hybrid"
+    if a.json:
+        print(json.dumps({"query": a.query, "mode": mode, "model": "" if note else EMBED_MODEL, "note": note,
+                          "results": res}, indent=1))
+        return
+    if note:
+        print(f"({note})", file=sys.stderr)
+    if not res:
+        print("(no experiments match)")
+        return
+    many = len(projects) > 1
+    for r in res:
+        print(f"{r['id']:<44} {r['kind']:<10} {r['status']:<10}" + (f" [{r['project']}]" if many else ""))
+        line = r["finding"] or r["title"]
+        if line:
+            print(f"    {line[:160]}{'…' if len(line) > 160 else ''}")
 
 
 def cmd_list(a):
@@ -3665,6 +4104,15 @@ def main():
     s.add_argument("--status")
     s.add_argument("--tag")
 
+    s = sub.add_parser("search", help="rank every experiment on this machine against a query (keywords + meaning)")
+    s.add_argument("query")
+    s.add_argument("--project", default="", help="one project: its name (see `lab-exp projects`) or root path")
+    s.add_argument("--kind", default="")
+    s.add_argument("--status", default="")
+    s.add_argument("--since", default="", help="experiments dated on or after YYYY-MM-DD, or within the last Nd days")
+    s.add_argument("--limit", type=int, default=10, help="results to show (default 10)")
+    s.add_argument("--json", action="store_true", help="machine-readable results (for agents)")
+
     s = sub.add_parser("viz", help="list / run applicable visualizers")
     s.add_argument("id")
     s.add_argument("name", nargs="?")
@@ -3721,7 +4169,7 @@ def main():
     {"init": cmd_init, "new": cmd_new, "run": cmd_run, "done": cmd_done, "supersede": cmd_supersede, "important": cmd_important, "note": cmd_note,
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
-     "list": cmd_list, "viz": cmd_viz, "serve": cmd_serve,
+     "list": cmd_list, "search": cmd_search, "viz": cmd_viz, "serve": cmd_serve,
      "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents, "report": cmd_report,
      "retire-worktree": cmd_retire_worktree,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)

@@ -863,5 +863,135 @@ class LabExpTests(unittest.TestCase):
         self.assertEqual(txt2.count("- [ ] check Y"), 1)
 
 
+    # ---- search ---------------------------------------------------------------------------------
+
+    # A stand-in for litmap's environment: run as `<this> -c <worker> <model>`, it speaks the worker's
+    # protocol with bag-of-concept vectors, where words that mean the same thing share one dimension.
+    # That is the one property the hybrid search relies on: a rephrasing lands near the original.
+    FAKE_EMBEDDER = """#!{python}
+import base64, json, math, re, struct, sys
+CONCEPTS = [("knockdown", "silencing", "silence", "crispri", "knock"), ("zebrafish", "fish"),
+            ("loss", "error"), ("lamin", "lmna"), ("mouse", "murine")]
+def vec(text):
+    words = re.findall(r"[a-z]+", text.lower())
+    v = [sum(w.startswith(c) for w in words for c in group) for group in CONCEPTS] + [0.01]
+    n = math.sqrt(sum(x * x for x in v))
+    return base64.b64encode(struct.pack(f"{{len(v)}}f", *(x / n for x in v))).decode()
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    with open({log!r}, "a") as fh:
+        fh.write(req["mode"] + "\\n")
+    print(json.dumps({{"vecs": [vec(t) for t in req["texts"]]}}), flush=True)
+"""
+
+    def _search_project(self):
+        self.p.init()
+        a = self.p.new("lmna-ko", kind="analysis", title="LMNA knockdown in fibroblasts", tags="screen:prut")
+        b = self.p.new("long-run", kind="training", title="Training to 500k steps")
+        c = self.p.new("mouse-baseline", kind="training", title="Murine baseline")
+        self.p.run("done", a, "--finding", "LMNA knockdown rescues FUS: 0.42 vs 0.10 control", "--metrics", "auroc=0.91")
+        self.p.run("done", b, "--finding", "val_loss keeps falling past 300k", "--metrics", "val_loss=0.31")
+        return a, b, c
+
+    def _search(self, *args, embedder="/nonexistent/python"):
+        env = {**self.p.env, "LAB_EXP_EMBED_PYTHON": embedder}
+        r = subprocess.run([sys.executable, str(LAB_EXP), "search", *args, "--json"], cwd=self.p.root, env=env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_search_keyword_hits_filters_and_stays_current(self):
+        """Without litmap's environment search is keyword-only and says so; exact tokens (a gene, a
+        metric name, "500k") find their experiment; the index follows done / supersede / deletion
+        without any rebuild step, and lives outside the repository."""
+        a, b, c = self._search_project()
+        res = self._search("LMNA")
+        self.assertEqual(res["mode"], "keyword")
+        self.assertIn("litmap's environment is missing", res["note"])
+        self.assertEqual(res["results"][0]["id"], a)
+        self.assertEqual(self._search("val_loss")["results"][0]["id"], b)          # a metric name
+        self.assertEqual(self._search("500k")["results"][0]["id"], b)              # a token in the title
+        self.assertEqual(self._search(a)["results"][0]["id"], a)                   # an id
+        self.assertEqual([r["id"] for r in self._search("baseline", "--kind", "analysis")["results"]], [])
+        self.assertEqual([r["id"] for r in self._search("baseline", "--status", "planned")["results"]], [c])
+        self.assertEqual(self._search("LMNA", "--since", "1d")["results"][0]["id"], a)
+        self.assertEqual(self._search("LMNA", "--since", "2999-01-01")["results"], [])
+        # finishing an experiment indexes its finding on the next search
+        self.assertEqual(self._search("zebrafish")["results"], [])
+        self.p.run("done", c, "--finding", "zebrafish transfer fails")
+        self.assertEqual([r["id"] for r in self._search("zebrafish")["results"]], [c])
+        self.p.run("supersede", c, "--by", a)
+        self.assertEqual([r["id"] for r in self._search("zebrafish", "--status", "superseded")["results"]], [c])
+        shutil.rmtree(self.p.root / "experiments" / c)                          # gone from the record too:
+        self.p.run("registry", "--rebuild")                                        # its entry leaves the index
+        self.assertEqual(self._search("zebrafish")["results"], [])
+        self.assertTrue((self.p.home / ".cache" / "lab" / "exp-search.db").is_file())
+        self.assertEqual(list(self.p.root.rglob("*.db")), [])                      # nothing lands in the repo
+
+    def test_search_hybrid_finds_rephrasings_that_keywords_miss(self):
+        a, b, c = self._search_project()
+        log = self.p.tmp / "embed.log"
+        fake = self.p.tmp / "fake-python"
+        fake.write_text(self.FAKE_EMBEDDER.format(python=sys.executable, log=str(log)))
+        fake.chmod(0o755)
+        self.assertEqual(self._search("gene silencing")["results"], [])           # no README says "silencing"
+        res = self._search("gene silencing", embedder=str(fake))
+        self.assertEqual(res["mode"], "hybrid")
+        self.assertEqual(res["results"][0]["id"], a)
+        self.assertEqual(res["results"][0]["semantic_rank"], 1)
+        self.assertIsNone(res["results"][0]["keyword_rank"])
+        # documents are embedded once; the next search embeds only its query
+        self.assertEqual(log.read_text().split(), ["document", "query"])
+        self._search("murine", embedder=str(fake))
+        self.assertEqual(log.read_text().split(), ["document", "query", "query"])
+        # an experiment matching both ways outranks one matching only by meaning
+        res = self._search("mouse baseline knockdown", embedder=str(fake))
+        self.assertEqual(res["results"][0]["id"], c)
+
+    def test_search_falls_back_to_keywords_when_the_embedder_fails(self):
+        self._search_project()
+        broken = self.p.tmp / "broken-python"
+        broken.write_text(f"#!{sys.executable}\nimport sys\nprint('CUDA out of memory', file=sys.stderr)\nsys.exit(1)\n")
+        broken.chmod(0o755)
+        res = self._search("LMNA", embedder=str(broken))
+        self.assertEqual(res["mode"], "keyword")
+        self.assertIn("CUDA out of memory", res["note"])
+        self.assertEqual(len(res["results"]), 1)
+
+    def test_search_fusion_rewards_agreement_between_rankings(self):
+        mod = self._mod()
+        s = mod.rrf([["kw-only", "both"], ["sem-only", "both"]])
+        self.assertGreater(s["both"], s["kw-only"])      # second in both lists beats first in one
+        self.assertAlmostEqual(s["kw-only"], s["sem-only"])
+        self.assertAlmostEqual(s["kw-only"], 1 / 61)
+        self.assertEqual(mod.fts_query("runs where we knocked down LMNA"), '"runs" OR "knocked" OR "down" OR "lmna"')
+        self.assertEqual(mod.fts_query('NEAR(lmna* -- "x'), '"near" OR "lmna" OR "x"')   # FTS syntax is quoted away
+
+    def test_live_hub_filter_box_searches_on_the_server(self):
+        import threading
+        import urllib.request
+        a, b, c = self._search_project()
+        mod = self._mod()
+        mod.SEARCH_DB = self.p.home / ".cache" / "lab" / "exp-search.db"
+        mod.EMBED_PYTHON = "/nonexistent/python"
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def get(path):
+                with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}{path}") as r:
+                    return r.read().decode()
+            res = json.loads(get("/proj/search?q=val_loss"))
+            self.assertEqual(res["ids"], [b])
+            self.assertEqual(res["mode"], "keyword")
+            self.assertIn("missing", res["note"])
+            self.assertIn('fetch("search?q="', get("/proj/"))
+        finally:
+            srv.shutdown(); srv.server_close()
+        static = self.p.tmp / "site"
+        self.p.run("hub", "--out", str(static))
+        self.assertIn("const LIVE = false", "".join(p.read_text() for p in static.rglob("*.html")))
+
+
 if __name__ == "__main__":
     unittest.main()

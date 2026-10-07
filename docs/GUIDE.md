@@ -137,6 +137,7 @@ project/
 
 ```bash
 lab-exp list                                   # what exists? (filters: --kind --tag --status)
+lab-exp search "lmna knockdown rescue" --json  # every project here, by words and meaning (--project --kind --status --since)
 lab-exp new my-idea --kind training --tags arch:foo --based-on 20260701-baseline
 # ... write README Hypothesis+Method, implement run.py (import from <pkg>/) ...
 lab-exp run 20260720-my-idea                   # local box: runs+logs; CW cell: submits via lab-slurm
@@ -176,6 +177,21 @@ and check it; a submitted job is not a finished job. `--gpus/--time/--partition`
 Kinds and structured tag keys are declared in `.lab-exp.toml`. `kind` = lifecycle type (training,
 analysis, ...) → picks the template; `tags` = what it is (`arch:x`, `objective:y`) → filtering,
 wandb grouping, and visualizer MATCH.
+
+## Search
+
+`lab-exp search "QUERY"` ranks every experiment of every lab-exp project on the machine against
+the query, two ways merged by reciprocal rank fusion: SQLite FTS5 keyword search (BM25 over id,
+title, finding, tags, kind, status, metrics and README text) catches exact tokens such as ids,
+gene names, metric names and "500k"; embedding similarity catches rephrasings. The embedding model
+(`EMBED_MODEL`, or `LAB_EXP_EMBED_MODEL`) runs in litmap's environment, never inside lab-exp; where
+that environment is missing, search is keyword-only and says so (`"mode": "keyword"` and a `note`
+in `--json`). The index is a cache at `~/.cache/lab/exp-search.db`, outside every repository:
+each search re-reads only the experiments whose README, metrics.json or registry row changed, so
+`new`, `done`, `note` and `supersede` show up on the next search. Deleting the file rebuilds it.
+A CLI search loads the model each time (about 15 s); the live hub keeps it loaded, and its filter
+box adds the server's hits to the substring match. The first search on a machine embeds every
+experiment once (about 0.5 s each on CPU).
 
 ## Visualizers — never rewrite a plot
 
