@@ -190,7 +190,16 @@ in `--json`). The index is a cache at `~/.cache/lab/exp-search.db`, outside ever
 each search re-reads only the experiments whose README, metrics.json or registry row changed, so
 `new`, `done`, `note` and `supersede` show up on the next search. Deleting the file rebuilds it.
 A CLI search loads the model each time (about 15 s); the live hub keeps it loaded, and its filter
-box adds the server's hits to the substring match. The first search on a machine embeds every
+box adds the server's hits to the substring match.
+
+Figures are searchable too. `lab-exp done` starts `lab-exp index-figures <id>` in the background
+(log: `~/.cache/lab/exp-figures.log`), which renders the experiment's figures and embeds them as
+images in the same space as text queries: image files under `out/` (up to 40, shallowest first;
+a PDF's first page), and inside its HTML reports the embedded PNGs, inline SVGs and Vega-Lite
+charts written as JSON in `vegaEmbed()` (a spec built in JavaScript is skipped). An experiment then
+also ranks by its best-matching figure, and `--json` names the matching figures
+(`"figures": ["umap.png", "report.html#chart2"]`). Run `lab-exp index-figures` with no ids to catch
+up experiments finished before, or whose figures changed after `done`; it re-embeds only what changed. The first search on a machine embeds every
 experiment once (about 1 s each on CPU with EmbeddingGemma 2).
 
 ## Visualizers — never rewrite a plot

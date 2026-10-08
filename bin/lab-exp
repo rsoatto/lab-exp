@@ -1590,6 +1590,7 @@ def cmd_done(a):
                            + (f"  \nmetrics: {metrics}" if metrics else "") + "\n")
     if a.follow_up:
         append_followups(d / "README.md", a.follow_up)
+    spawn_figure_index(root, eid)            # figure search: render and embed out/'s figures, in the background
     # check declared produces (same nested-aware matching as viz REQUIRES)
     produced = out_artifacts(d / "out")
     missing = [p for p in split_list(read_front(d / "README.md").get("produces", ""))
@@ -2164,6 +2165,7 @@ class HubSearch:
     from the keyword index alone rather than wait, and says so."""
     REFRESH = 15
     LIMIT = 20
+    FIG_HITS = 5
 
     def __init__(self):
         import threading
@@ -2203,7 +2205,7 @@ class HubSearch:
         if not self.lock.acquire(timeout=2):
             con = search_db()
             try:
-                ids = [r["id"] for r in search_index(con, text, proj, None, self.LIMIT)]
+                ids = [r["id"] for r in search_index(con, text, proj, None, self.LIMIT)[0]]
             finally:
                 con.close()
             return {"ids": ids, "mode": "keyword", "note": "keyword-only for now: semantic search is still indexing"}
@@ -2212,15 +2214,17 @@ class HubSearch:
             con = search_db()
             try:
                 try:
-                    res = search_index(con, text, proj, self.emb, self.LIMIT)
+                    res, figres = search_index(con, text, proj, self.emb, self.LIMIT)
                 except EmbedError as e:
                     self.emb, self.note = None, f"keyword-only search: {e}"
-                    res = search_index(con, text, proj, None, self.LIMIT)
+                    res, figres = search_index(con, text, proj, None, self.LIMIT)
             finally:
                 con.close()
         finally:
             self.lock.release()
-        return {"ids": [r["id"] for r in res], "mode": "keyword" if self.emb is None else "hybrid", "note": self.note}
+        # The filter shows the text matches plus the experiments with the FIG_HITS best-matching figures.
+        ids = list(dict.fromkeys([r["id"] for r in res] + [r["id"] for r in figres[:self.FIG_HITS]]))
+        return {"ids": ids, "mode": "keyword" if self.emb is None else "hybrid", "note": self.note}
 
 
 def make_live_handler(slugmap, index_html=None, peer="", searcher=None):
@@ -2692,6 +2696,8 @@ CREATE TABLE IF NOT EXISTS docs (key TEXT PRIMARY KEY, project TEXT, id TEXT, di
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(key UNINDEXED, id, title, finding, tags, kind,
     status, metrics, body, tokenize='porter unicode61');
 CREATE TABLE IF NOT EXISTS vecs (key TEXT, model TEXT, hash TEXT, vec BLOB, PRIMARY KEY (key, model));
+CREATE TABLE IF NOT EXISTS figs (key TEXT, ref TEXT, sig TEXT, model TEXT, vec BLOB, err TEXT,
+    PRIMARY KEY (key, ref, model));
 """
 # bm25() weights, one per fts column in order (key is unindexed): a word in the id or title says more
 # about an experiment than the same word somewhere in its README.
@@ -2789,8 +2795,51 @@ torch.set_num_threads(int(os.environ.get("LAB_EXP_EMBED_THREADS") or min(32, os.
 from sentence_transformers import SentenceTransformer
 m = SentenceTransformer(sys.argv[1], device=os.environ.get("LAB_EXP_EMBED_DEVICE") or "cpu")
 print(json.dumps({"ready": True}), file=out, flush=True)
+
+def render(it):
+    """One figure source (see figure_sources) as an RGB image at most 1024 px on a side, on white."""
+    import io
+    from PIL import Image
+    def page(doc):
+        r = doc[0].rect
+        import fitz
+        z = min(4.0, 1024 / max(r.width, r.height, 1))
+        return Image.open(io.BytesIO(doc[0].get_pixmap(matrix=fitz.Matrix(z, z)).tobytes("png")))
+    if "png" in it:
+        im = Image.open(io.BytesIO(base64.b64decode(it["png"])))
+    elif "vegalite" in it or "vega" in it:
+        import vl_convert as vlc
+        im = Image.open(io.BytesIO(vlc.vegalite_to_png(it["vegalite"]) if "vegalite" in it else vlc.vega_to_png(it["vega"])))
+    elif "svg" in it:
+        import fitz
+        im = page(fitz.open(stream=it["svg"].encode(), filetype="svg"))
+    elif it["file"].lower().endswith((".svg", ".pdf")):
+        import fitz
+        im = page(fitz.open(it["file"]))
+    else:
+        im = Image.open(it["file"])
+        im.seek(0)
+    im.thumbnail((1024, 1024))
+    im = im.convert("RGBA")
+    bg = Image.new("RGB", im.size, "white")
+    bg.paste(im, mask=im.split()[3])
+    return bg
+
+
 for line in sys.stdin:
     req = json.loads(line)
+    if req["mode"] == "images":         # figures: rendered here, embedded without a prompt (the model's rule for images)
+        ims, errs = [], []
+        for it in req["items"]:
+            try:
+                ims.append(render(it)); errs.append("")
+            except Exception as e:
+                ims.append(None); errs.append(f"{type(e).__name__}: {e}"[:300])
+        ok = [im for im in ims if im is not None]
+        v = iter(m.encode(ok, normalize_embeddings=True, batch_size=8, show_progress_bar=False, convert_to_numpy=True) if ok else [])
+        vecs = [base64.b64encode(next(v).astype("float32").tobytes()).decode() if im is not None else None for im in ims]
+        print(json.dumps({"vecs": vecs, "errors": errs}), file=out, flush=True)
+        continue
     enc = m.encode_query if req["mode"] == "query" else m.encode_document
     v = enc(req["texts"], normalize_embeddings=True, batch_size=8, show_progress_bar=False, convert_to_numpy=True)
     print(json.dumps({"vecs": [base64.b64encode(x.astype("float32").tobytes()).decode() for x in v]}), file=out, flush=True)
@@ -2840,15 +2889,23 @@ class Embedder:
             self._reply()
             self.ready = True
 
-    def embed(self, texts, mode):
-        """Unit vectors (bytes of float32) for `texts`, embedded as queries or as documents."""
+    def _ask(self, req):
         self.load()
         try:
-            self.proc.stdin.write(json.dumps({"mode": mode, "texts": list(texts)}) + "\n")
+            self.proc.stdin.write(json.dumps(req) + "\n")
             self.proc.stdin.flush()
         except OSError:
             self._reply()                 # the worker died: its reply is EOF, which raises with the reason
-        return [base64.b64decode(v) for v in self._reply()["vecs"]]
+        return self._reply()
+
+    def embed(self, texts, mode):
+        """Unit vectors (bytes of float32) for `texts`, embedded as queries or as documents."""
+        return [base64.b64decode(v) for v in self._ask({"mode": mode, "texts": list(texts)})["vecs"]]
+
+    def embed_images(self, items):
+        """[(vector bytes or None, error)] for figure sources (see figure_sources), rendered by the worker."""
+        r = self._ask({"mode": "images", "items": list(items)})
+        return [(base64.b64decode(v) if v else None, err) for v, err in zip(r["vecs"], r["errors"])]
 
     def close(self):
         if self.proc is not None:
@@ -2875,6 +2932,136 @@ def search_embed(con, emb, progress=None):
         if progress:
             progress(i + len(batch), len(todo))
     return len(todo)
+
+
+# ---- figures: each experiment's figures embedded as images, in the same space as text queries --------
+FIG_INDEX_MAX = 40          # figures per experiment (shallowest first): atlas experiments hold thousands
+REPORT_FIG_MAX = 20         # figures taken from one HTML report
+_DATA_IMG = re.compile(r"""src\s*=\s*["']data:image/(?:png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=\s]+)["']""", re.I)
+_SVG = re.compile(r"<svg\b.*?</svg>", re.S | re.I)
+_VEGA = re.compile(r"vegaEmbed\(\s*[^,()]+,\s*(?=\{)")
+
+
+def report_figures(text):
+    """[(fragment, source)] for the figures inside one HTML report: embedded PNG/JPEG images, inline
+    SVGs (not icons: under 2 kB of markup), and Vega / Vega-Lite charts whose spec is written as a JSON
+    literal in a vegaEmbed() call (the house style; a spec built in JavaScript needs a browser, so it
+    is skipped). Sources are what the embedding worker renders."""
+    out = []
+    for i, m in enumerate(_DATA_IMG.finditer(text), 1):
+        out.append((f"img{i}", {"png": re.sub(r"\s", "", m[1])}))
+    for i, m in enumerate((m for m in _SVG.finditer(text) if len(m[0]) >= 2000), 1):
+        out.append((f"svg{i}", {"svg": m[0]}))
+    dec = json.JSONDecoder(parse_constant=lambda _c: None)     # NaN/Infinity in a spec: null, which renderers accept
+    for i, m in enumerate(_VEGA.finditer(text), 1):
+        try:
+            spec = dec.raw_decode(text, m.end())[0]
+        except ValueError:
+            continue
+        lite = "vega-lite" in str(spec.get("$schema", "vega-lite")) if isinstance(spec, dict) else True
+        out.append((f"chart{i}", {"vegalite" if lite else "vega": json.dumps(spec)}))
+    return out[:REPORT_FIG_MAX]
+
+
+def figure_sources(e):
+    """[(ref, sig, source)] for one view entry's figures: image files under out/ (list_figures; a PDF
+    contributes its first page), shallowest first, then the figures inside its HTML reports (ref
+    "report.html#chart2"). sig changes when the file does; source is what the worker renders."""
+    if e["out"] is None:
+        return []
+    outd, out = e["out"], []
+    figs, _total, _trunc = list_figures(outd)
+    for rel in sorted(figs, key=lambda r: (r.count("/"), r))[:FIG_INDEX_MAX]:
+        out.append((rel, _sig(outd / rel), {"file": str(outd / rel)}))
+    try:
+        reps = sorted(q.relative_to(outd).as_posix() for q in list(outd.glob("*.html")) + list(outd.glob("*/*.html")))
+    except OSError:
+        reps = []
+    for rel in reps:
+        try:
+            text = (outd / rel).read_text(errors="replace")
+        except OSError:
+            continue
+        sig = _sig(outd / rel)
+        out += [(f"{rel}#{frag}", sig, src) for frag, src in report_figures(text)]
+    return out
+
+
+def index_figures(con, emb, entries, say=print):
+    """Embed the figures of `entries` (view entries) that changed since they were last embedded under
+    emb.model, and forget figures that are gone. A figure that fails to render is recorded with its
+    error and retried only when its file changes. Returns (embedded, failed, unchanged)."""
+    todo, done_n = [], 0
+    for e in entries:
+        key = f"{project_name(e['root'])}/{e['id']}"
+        have = {ref: sig for ref, sig in con.execute("SELECT ref, sig FROM figs WHERE key = ? AND model = ?", (key, emb.model))}
+        srcs = figure_sources(e)
+        refs = {ref for ref, _s, _src in srcs}
+        for ref in set(have) - refs:
+            con.execute("DELETE FROM figs WHERE key = ? AND ref = ? AND model = ?", (key, ref, emb.model))
+        todo += [(key, ref, sig, src) for ref, sig, src in srcs if have.get(ref) != sig]
+        done_n += sum(1 for ref, sig, _src in srcs if have.get(ref) == sig)
+    con.commit()
+    failed = 0
+    for i in range(0, len(todo), 8):
+        batch = todo[i:i + 8]
+        res = emb.embed_images([src for _k, _r, _s, src in batch])
+        con.executemany("INSERT OR REPLACE INTO figs VALUES (?,?,?,?,?,?)",
+                        [(k, r, sg, emb.model, v, err) for (k, r, sg, _src), (v, err) in zip(batch, res)])
+        con.commit()
+        for (k, r, _sg, _src), (v, err) in zip(batch, res):
+            if v is None:
+                failed += 1
+                say(f"  could not render {k} {r}: {err}")
+        say(f"  figures embedded: {min(i + 8, len(todo))}/{len(todo)}")
+    return len(todo) - failed, failed, done_n
+
+
+def cmd_index_figures(a):
+    """lab-exp index-figures [ID ...] [--project P]: embed experiments' figures for search. `done` runs
+    it in the background for the experiment it records; with no ids it catches up every experiment."""
+    if a.ids:
+        root = find_root(a.root)
+        roots, idx = [root], view_index(root)
+        try:
+            entries = [view_entry(root, i, idx) for i in a.ids]
+        except ValueError as e:
+            die(str(e))
+    else:
+        roots = search_roots(a.project)
+        entries = [e for r in roots for e in view_index(r).values()]
+    con = search_db()
+    search_refresh(con, roots)
+    emb = Embedder()
+    # One indexing job at a time per index: a sweep finishing twenty experiments at once queues twenty
+    # jobs, and each would otherwise load its own copy of the model on the same box.
+    with open(SEARCH_DB.with_suffix(".figures.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            n, failed, same = index_figures(con, emb, entries, lambda msg: print(msg, flush=True))
+        except EmbedError as e:
+            die(f"figures not embedded: {e}")
+        finally:
+            emb.close()
+    print(f"figures: {n} embedded, {failed} could not be rendered, {same} unchanged ({len(entries)} experiment(s), {emb.model})")
+
+
+def spawn_figure_index(root, eid):
+    """Start `lab-exp index-figures <eid>` detached, logging to ~/.cache/lab/exp-figures.log: rendering
+    and embedding take a minute or more, and `done` must return at once. LAB_EXP_NO_FIGURE_INDEX=1
+    turns it off."""
+    if os.environ.get("LAB_EXP_NO_FIGURE_INDEX"):
+        return
+    try:
+        SEARCH_DB.parent.mkdir(parents=True, exist_ok=True)
+        with open(SEARCH_DB.parent / "exp-figures.log", "a") as log:
+            log.write(f"--- {datetime.now().isoformat(timespec='seconds')} {socket.gethostname().split('.')[0]} {eid}\n")
+            log.flush()
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "index-figures", eid],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                             env={**os.environ, "LAB_EXP_EMBED_THREADS": os.environ.get("LAB_EXP_EMBED_THREADS", "8")})
+    except OSError as e:
+        warn(f"figure indexing not started ({e}); run `lab-exp index-figures {eid}`")
 
 
 def fts_query(text):
@@ -2906,9 +3093,19 @@ def since_date(s):
 
 
 def search_index(con, query, projects, emb=None, limit=10, kind="", status="", since=""):
-    """Rank the indexed experiments of `projects` (names) against `query`. Each leg contributes its top
-    `limit` -- BM25 over the keyword index, cosine against the query's embedding when `emb` is given --
-    and the fused list is cut to `limit`. Rows: the docs fields plus score, keyword_rank, semantic_rank."""
+    """Rank the indexed experiments of `projects` (names) against `query`. Returns (results,
+    figure_results), each at most `limit` rows of the docs fields.
+
+    results fuse two rankings, each contributing its top `limit`: BM25 over the keyword index and,
+    with `emb`, cosine between the query's embedding and each experiment's text. Rows add score,
+    keyword_rank, semantic_rank, and figures (the experiment's best-matching figures when it is also
+    among figure_results).
+
+    figure_results rank experiments by their best-matching figure (cosine between the query and the
+    figure's image embedding; empty without `emb`), adding figure_rank, figure_score and figures (best
+    first). A separate list, not a third fused ranking: on 10 figure queries with fixed answers the
+    figure ranking alone put a right answer in the top 5 for 0.90 of them, fused it fell to 0.47, and
+    fusing it cost ordinary text queries 0.12 of mean reciprocal rank (2026-10-08)."""
     from array import array
     where, args = [f"d.project IN ({','.join('?' * len(projects))})"], list(projects)
     for col, val in (("kind", kind), ("status", status)):
@@ -2927,27 +3124,41 @@ def search_index(con, query, projects, emb=None, limit=10, kind="", status="", s
             f"ORDER BY bm25(fts, {BM25_WEIGHTS}) LIMIT ?", [expr, *args, limit])])
     else:
         legs.append([])
+    figs = {}
     if emb is not None:
         qv = array("f", emb.embed([query], "query")[0])
-        sims = []
-        for key, blob in con.execute(f"SELECT d.key, v.vec FROM vecs v JOIN docs d ON d.key = v.key AND v.hash = d.ehash "
-                                     f"WHERE v.model = ? AND {cond}", [emb.model, *args]):
-            sims.append((sum(map(float.__mul__, qv, array("f", blob))), key))
+        dot = lambda blob: sum(map(float.__mul__, qv, array("f", blob)))
+        sims = [(dot(blob), key) for key, blob in con.execute(
+            f"SELECT d.key, v.vec FROM vecs v JOIN docs d ON d.key = v.key AND v.hash = d.ehash "
+            f"WHERE v.model = ? AND {cond}", [emb.model, *args])]
         legs.append([k for _s, k in sorted(sims, reverse=True)[:limit]])
+        for key, ref, blob in con.execute(f"SELECT d.key, f.ref, f.vec FROM figs f JOIN docs d ON d.key = f.key "
+                                          f"WHERE f.model = ? AND f.vec IS NOT NULL AND {cond}", [emb.model, *args]):
+            figs.setdefault(key, []).append((dot(blob), ref))
+        for v in figs.values():
+            v.sort(reverse=True)
+    fig_top = sorted(figs, key=lambda k: -figs[k][0][0])[:limit]
     scores = rrf(legs)
     top = sorted(scores, key=lambda k: -scores[k])[:limit]
     cols = ["key", "project", "id", "dir", "kind", "status", "date", "title", "finding", "tags", "metrics"]
+    want = list(dict.fromkeys(top + fig_top))
     rows = {r[0]: dict(zip(cols, r)) for r in con.execute(
-        f"SELECT {', '.join(cols)} FROM docs WHERE key IN ({','.join('?' * len(top))})", top)} if top else {}
-    out = []
+        f"SELECT {', '.join(cols)} FROM docs WHERE key IN ({','.join('?' * len(want))})", want)} if want else {}
+    shown = lambda key: [ref for _s, ref in figs[key][:3]]
+    results = []
     for key in top:
-        r = rows[key]
-        r.pop("key")
+        r = {k: v for k, v in rows[key].items() if k != "key"}
         r["score"] = round(scores[key], 5)
         r["keyword_rank"] = legs[0].index(key) + 1 if key in legs[0] else None
         r["semantic_rank"] = (legs[1].index(key) + 1 if key in legs[1] else None) if emb is not None else None
-        out.append(r)
-    return out
+        r["figures"] = shown(key) if key in fig_top else []
+        results.append(r)
+    figure_results = []
+    for i, key in enumerate(fig_top, 1):
+        r = {k: v for k, v in rows[key].items() if k != "key"}
+        r.update(figure_rank=i, figure_score=round(figs[key][0][0], 4), figures=shown(key))
+        figure_results.append(r)
+    return results, figure_results
 
 
 def search_roots(project=""):
@@ -2987,10 +3198,10 @@ def cmd_search(a):
             emb, note = None, f"keyword-only search: {e}"
     try:
         try:
-            res = search_index(con, a.query, projects, emb, a.limit, a.kind, a.status, a.since)
+            res, figres = search_index(con, a.query, projects, emb, a.limit, a.kind, a.status, a.since)
         except EmbedError as e:
             note = f"keyword-only search: {e}"
-            res = search_index(con, a.query, projects, None, a.limit, a.kind, a.status, a.since)
+            res, figres = search_index(con, a.query, projects, None, a.limit, a.kind, a.status, a.since)
     except ValueError as e:
         die(str(e))
     finally:
@@ -2999,7 +3210,7 @@ def cmd_search(a):
     mode = "keyword" if note else "hybrid"
     if a.json:
         print(json.dumps({"query": a.query, "mode": mode, "model": "" if note else EMBED_MODEL, "note": note,
-                          "results": res}, indent=1))
+                          "results": res, "figure_results": figres}, indent=1))
         return
     if note:
         print(f"({note})", file=sys.stderr)
@@ -3012,6 +3223,12 @@ def cmd_search(a):
         line = r["finding"] or r["title"]
         if line:
             print(f"    {line[:160]}{'…' if len(line) > 160 else ''}")
+        if r["figures"]:
+            print(f"    figures: {', '.join(r['figures'])}")
+    if figres:
+        print("\nfigures that match:")
+        for r in figres[:5]:
+            print(f"  {r['id']:<42} {', '.join(r['figures'])}" + (f" [{r['project']}]" if many else ""))
 
 
 def cmd_list(a):
@@ -4115,6 +4332,10 @@ def main():
     s.add_argument("--limit", type=int, default=10, help="results to show (default 10)")
     s.add_argument("--json", action="store_true", help="machine-readable results (for agents)")
 
+    s = sub.add_parser("index-figures", help="embed experiments' figures for search (done runs it in the background)")
+    s.add_argument("ids", nargs="*", help="experiments (default: catch up every experiment on this machine)")
+    s.add_argument("--project", default="", help="with no ids: one project only")
+
     s = sub.add_parser("viz", help="list / run applicable visualizers")
     s.add_argument("id")
     s.add_argument("name", nargs="?")
@@ -4171,7 +4392,7 @@ def main():
     {"init": cmd_init, "new": cmd_new, "run": cmd_run, "done": cmd_done, "supersede": cmd_supersede, "important": cmd_important, "note": cmd_note,
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
-     "list": cmd_list, "search": cmd_search, "viz": cmd_viz, "serve": cmd_serve,
+     "list": cmd_list, "search": cmd_search, "index-figures": cmd_index_figures, "viz": cmd_viz, "serve": cmd_serve,
      "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents, "report": cmd_report,
      "retire-worktree": cmd_retire_worktree,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
