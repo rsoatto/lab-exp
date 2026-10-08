@@ -175,7 +175,7 @@ __FAVICON__
 </style></head><body>
 <header>
   <h1><a id="hubup" href="../" style="color:inherit;text-decoration:none" title="all projects">__TITLE__</a></h1><span class="count" id="count"></span>
-  <input type="search" id="q" placeholder="filter by id, tag, kind, finding…">
+  <input type="search" id="q" placeholder="filter by id, tag, kind, finding…"><span class="legend" id="qnote"></span>
   <span class="legend" id="datef"><select id="datepre" title="filter by experiment date">
       <option value="">all dates</option><option value="7">last 7 days</option><option value="30">last 30 days</option>
       <option value="90">last 90 days</option><option value="custom">custom range…</option></select>
@@ -827,15 +827,36 @@ function md(src) {
 
 /* ---- filter, pan, zoom ----------------------------------------------------------------- */
 const q = document.getElementById("q");
-let qTimer = null;
+const subMatch = t => new Set(NODES.filter(n =>
+  [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
+// LIVE: the server's `lab-exp search` (keywords + meaning) adds its hits to the substring matches, so
+// the box also finds experiments described in other words. The static page keeps the substring match
+// alone; a failed request leaves it in place too.
+let searchSeq = 0;
+async function serverSearch(t) {
+  if (!LIVE || !t) return;
+  const seq = ++searchSeq, have = new Set(ALL_IDS);
+  try {
+    const r = await fetch("search?q=" + encodeURIComponent(t), { cache: "no-store" });
+    if (!r.ok) return;
+    const res = await r.json();
+    if (seq !== searchSeq || q.value.trim().toLowerCase() !== t) return;    // a newer query is in flight
+    matched = new Set([...subMatch(t), ...res.ids.filter(id => have.has(id))]);
+    document.getElementById("qnote").textContent = res.note ? "keywords only" : "";
+    document.getElementById("qnote").title = res.note || "";
+    refilter();
+  } catch (e) { /* the substring matches stand */ }
+}
+let qTimer = null, sTimer = null;
 q.addEventListener("input", () => {
-  clearTimeout(qTimer);
+  clearTimeout(qTimer); clearTimeout(sTimer);
   qTimer = setTimeout(() => {
     const t = q.value.trim().toLowerCase();
-    matched = !t ? null : new Set(NODES.filter(n =>
-      [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
+    matched = !t ? null : subMatch(t);
     refilter();
   }, 90);
+  const t = q.value.trim().toLowerCase();
+  if (LIVE && t) sTimer = setTimeout(() => serverSearch(t), 350);
 });
 // Escape clears the search from anywhere — otherwise a stray query leaves the graph dimmed with no
 // obvious way back except selecting the text.
@@ -988,7 +1009,8 @@ for (const id of ["datefrom", "dateto"])
   if (P.get("q")) {
     q.value = P.get("q");
     const t = q.value.trim().toLowerCase();
-    matched = new Set(NODES.filter(n => [n.id, n.kind, n.status, n.tags, n.finding].join(" ").toLowerCase().includes(t)).map(n => n.id));
+    matched = subMatch(t);
+    serverSearch(t);
   }
 })();
 buildDom();

@@ -2,6 +2,7 @@
 
 Each test builds a throwaway project (with its own git repo and HOME) and drives the real CLI
 via subprocess, so what is tested is exactly what an agent runs."""
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -51,7 +52,9 @@ class Project:
         self.root = self.tmp / "proj"
         self.root.mkdir()
         self.env = {**os.environ, "HOME": str(self.home), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", "WANDB_MODE": "offline"}
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", "WANDB_MODE": "offline",
+                    # never the real embedding environment: search tests pass their own stand-in
+                    "LAB_EXP_EMBED_PYTHON": "/nonexistent/python"}
         self.git("init", "-q")
         self.git("commit", "-q", "--allow-empty", "-m", "root")
 
@@ -861,6 +864,207 @@ class LabExpTests(unittest.TestCase):
         txt2 = self.p.readme(a).read_text()
         self.assertEqual(txt2.count("- [ ] check X"), 1)
         self.assertEqual(txt2.count("- [ ] check Y"), 1)
+
+
+    # ---- search ---------------------------------------------------------------------------------
+
+    # A stand-in for litmap's environment: run as `<this> -c <worker> <model>`, it speaks the worker's
+    # protocol with bag-of-concept vectors, where words that mean the same thing share one dimension.
+    # That is the one property the hybrid search relies on: a rephrasing lands near the original.
+    FAKE_EMBEDDER = """#!{python}
+import base64, json, math, re, struct, sys
+CONCEPTS = [("knockdown", "silencing", "silence", "crispri", "knock"), ("zebrafish", "fish"),
+            ("loss", "error"), ("lamin", "lmna"), ("mouse", "murine")]
+def vec(text):
+    words = re.findall(r"[a-z]+", text.lower())
+    v = [sum(w.startswith(c) for w in words for c in group) for group in CONCEPTS] + [0.01]
+    n = math.sqrt(sum(x * x for x in v))
+    return base64.b64encode(struct.pack(f"{{len(v)}}f", *(x / n for x in v))).decode()
+def item_text(it):                    # a figure "renders" to its own text; "corrupt" fails to render
+    if "file" in it:
+        return open(it["file"], errors="ignore").read()
+    if "png" in it:
+        return base64.b64decode(it["png"]).decode("latin-1")
+    return it.get("svg") or it.get("vegalite") or it.get("vega") or ""
+print(json.dumps({{"ready": True}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    with open({log!r}, "a") as fh:
+        fh.write(req["mode"] + "\\n")
+    if req["mode"] == "images":
+        texts = [item_text(it) for it in req["items"]]
+        print(json.dumps({{"vecs": [None if "corrupt" in t else vec(t) for t in texts],
+                          "errors": ["cannot identify image" if "corrupt" in t else "" for t in texts]}}), flush=True)
+        continue
+    print(json.dumps({{"vecs": [vec(t) for t in req["texts"]]}}), flush=True)
+"""
+
+    def _search_project(self):
+        self.p.init()
+        a = self.p.new("lmna-ko", kind="analysis", title="LMNA knockdown in fibroblasts", tags="screen:prut")
+        b = self.p.new("long-run", kind="training", title="Training to 500k steps")
+        c = self.p.new("mouse-baseline", kind="training", title="Murine baseline")
+        self.p.run("done", a, "--finding", "LMNA knockdown rescues FUS: 0.42 vs 0.10 control", "--metrics", "auroc=0.91")
+        self.p.run("done", b, "--finding", "val_loss keeps falling past 300k", "--metrics", "val_loss=0.31")
+        return a, b, c
+
+    def _search(self, *args, embedder="/nonexistent/python"):
+        env = {**self.p.env, "LAB_EXP_EMBED_PYTHON": embedder}
+        r = subprocess.run([sys.executable, str(LAB_EXP), "search", *args, "--json"], cwd=self.p.root, env=env,
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_search_keyword_hits_filters_and_stays_current(self):
+        """Without litmap's environment search is keyword-only and says so; exact tokens (a gene, a
+        metric name, "500k") find their experiment; the index follows done / supersede / deletion
+        without any rebuild step, and lives outside the repository."""
+        a, b, c = self._search_project()
+        res = self._search("LMNA")
+        self.assertEqual(res["mode"], "keyword")
+        self.assertIn("litmap's environment is missing", res["note"])
+        self.assertEqual(res["results"][0]["id"], a)
+        self.assertEqual(self._search("val_loss")["results"][0]["id"], b)          # a metric name
+        self.assertEqual(self._search("500k")["results"][0]["id"], b)              # a token in the title
+        self.assertEqual(self._search(a)["results"][0]["id"], a)                   # an id
+        self.assertEqual([r["id"] for r in self._search("baseline", "--kind", "analysis")["results"]], [])
+        self.assertEqual([r["id"] for r in self._search("baseline", "--status", "planned")["results"]], [c])
+        self.assertEqual(self._search("LMNA", "--since", "1d")["results"][0]["id"], a)
+        self.assertEqual(self._search("LMNA", "--since", "2999-01-01")["results"], [])
+        # finishing an experiment indexes its finding on the next search
+        self.assertEqual(self._search("zebrafish")["results"], [])
+        self.p.run("done", c, "--finding", "zebrafish transfer fails")
+        self.assertEqual([r["id"] for r in self._search("zebrafish")["results"]], [c])
+        self.p.run("supersede", c, "--by", a)
+        self.assertEqual([r["id"] for r in self._search("zebrafish", "--status", "superseded")["results"]], [c])
+        shutil.rmtree(self.p.root / "experiments" / c)                          # gone from the record too:
+        self.p.run("registry", "--rebuild")                                        # its entry leaves the index
+        self.assertEqual(self._search("zebrafish")["results"], [])
+        self.assertTrue((self.p.home / ".cache" / "lab" / "exp-search.db").is_file())
+        self.assertEqual(list(self.p.root.rglob("*.db")), [])                      # nothing lands in the repo
+
+    def test_search_hybrid_finds_rephrasings_that_keywords_miss(self):
+        a, b, c = self._search_project()
+        fake, log = self._fake_embedder()
+        self.assertEqual(self._search("gene silencing")["results"], [])           # no README says "silencing"
+        res = self._search("gene silencing", embedder=str(fake))
+        self.assertEqual(res["mode"], "hybrid")
+        self.assertEqual(res["results"][0]["id"], a)
+        self.assertEqual(res["results"][0]["semantic_rank"], 1)
+        self.assertIsNone(res["results"][0]["keyword_rank"])
+        # documents are embedded once; the next search embeds only its query
+        self.assertEqual(log.read_text().split(), ["document", "query"])
+        self._search("murine", embedder=str(fake))
+        self.assertEqual(log.read_text().split(), ["document", "query", "query"])
+        # an experiment matching both ways outranks one matching only by meaning
+        res = self._search("mouse baseline knockdown", embedder=str(fake))
+        self.assertEqual(res["results"][0]["id"], c)
+
+    def _fake_embedder(self):
+        log = self.p.tmp / "embed.log"
+        fake = self.p.tmp / "fake-python"
+        fake.write_text(self.FAKE_EMBEDDER.format(python=sys.executable, log=str(log)))
+        fake.chmod(0o755)
+        return fake, log
+
+    def test_report_figures_extracts_images_svgs_and_json_charts(self):
+        mod = self._mod()
+        big_svg = "<svg width='400' height='300'>" + "<rect x='1' y='1' width='5' height='5'/>" * 60 + "</svg>"
+        page = ("<img src='data:image/png;base64,iVBORw0KGgo='><svg width='12'><path d='M0'/></svg>" + big_svg +
+                '<script>vegaEmbed("#f1", {"$schema": "https://vega.github.io/schema/vega-lite/v5.json", "mark": "bar"});'
+                "vegaEmbed('#f2', spec);</script>")
+        figs = mod.report_figures(page)
+        self.assertEqual([f for f, _src in figs], ["img1", "svg1", "chart1"])       # the 12px icon and the JS-built spec are skipped
+        self.assertEqual(figs[0][1], {"png": "iVBORw0KGgo="})
+        self.assertEqual(json.loads(figs[2][1]["vegalite"])["mark"], "bar")
+        nan = mod.report_figures('vegaEmbed("#x", {"data": {"values": [{"y": NaN}]}, "mark": "point"})')
+        self.assertEqual(json.loads(nan[0][1]["vegalite"])["data"]["values"], [{"y": None}])   # renderers reject NaN
+
+    def test_done_indexes_figures_in_the_background_and_search_finds_them(self):
+        """`done` returns at once and a background job embeds the experiment's figures (image files and
+        the charts inside its report); a search then finds the experiment by what its figures show
+        although no text of it says so, and names the figure."""
+        import sqlite3
+        import time
+        self.p.init()
+        a = self.p.new("plots", kind="analysis", title="Assorted plots")
+        b = self.p.new("other", kind="analysis", title="Unrelated mouse work")
+        out = self.p.root / "experiments" / a / "out"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "umap.png").write_text("zebrafish embryos")
+        (out / "broken.png").write_text("corrupt")
+        (out / "report.html").write_text('<script>vegaEmbed("#c", {"mark": "line", "title": "lamin levels"});</script>')
+        fake, log = self._fake_embedder()
+        env = {**self.p.env, "LAB_EXP_EMBED_PYTHON": str(fake)}
+        r = subprocess.run([sys.executable, str(LAB_EXP), "done", a, "--finding", "made some plots"], cwd=self.p.root,
+                           env=env, capture_output=True, text=True, check=True)
+        db = self.p.home / ".cache" / "lab" / "exp-search.db"
+        rows = []
+        for _ in range(100):
+            if db.is_file():
+                with contextlib.closing(sqlite3.connect(db, timeout=30)) as con:
+                    rows = con.execute("SELECT ref, vec IS NOT NULL, err FROM figs ORDER BY ref").fetchall()
+            if len(rows) == 3:
+                break
+            time.sleep(0.2)
+        self.assertEqual(rows, [("broken.png", 0, "cannot identify image"), ("report.html#chart1", 1, ""), ("umap.png", 1, "")],
+                         (self.p.home / ".cache" / "lab" / "exp-figures.log").read_text() if db.parent.is_dir() else "")
+        res = self._search("fish", embedder=str(fake))
+        self.assertEqual(res["figure_results"][0]["id"], a)                    # figures rank in their own list...
+        self.assertEqual(res["figure_results"][0]["figures"][0], "umap.png")
+        self.assertNotIn("broken.png", res["figure_results"][0]["figures"])     # (a figure that failed to render never matches)
+        self.assertNotIn("figure_rank", res["results"][0])                     # ...so text ranking is unchanged by them
+        self.assertEqual(self._search("lamin", embedder=str(fake))["figure_results"][0]["figures"][0], "report.html#chart1")
+        self.assertEqual(self._search("fish")["figure_results"], [])              # keyword-only: no figure list
+        # caught up: a second run embeds nothing (and so never loads the model)
+        before = log.read_text().count("images")
+        r = subprocess.run([sys.executable, str(LAB_EXP), "index-figures", a], cwd=self.p.root, env=env,
+                           capture_output=True, text=True, check=True)
+        self.assertIn("0 embedded, 0 could not be rendered, 3 unchanged", r.stdout)
+        self.assertEqual(log.read_text().count("images"), before)
+
+    def test_search_falls_back_to_keywords_when_the_embedder_fails(self):
+        self._search_project()
+        broken = self.p.tmp / "broken-python"
+        broken.write_text(f"#!{sys.executable}\nimport sys\nprint('CUDA out of memory', file=sys.stderr)\nsys.exit(1)\n")
+        broken.chmod(0o755)
+        res = self._search("LMNA", embedder=str(broken))
+        self.assertEqual(res["mode"], "keyword")
+        self.assertIn("CUDA out of memory", res["note"])
+        self.assertEqual(len(res["results"]), 1)
+
+    def test_search_fusion_rewards_agreement_between_rankings(self):
+        mod = self._mod()
+        s = mod.rrf([["kw-only", "both"], ["sem-only", "both"]])
+        self.assertGreater(s["both"], s["kw-only"])      # second in both lists beats first in one
+        self.assertAlmostEqual(s["kw-only"], s["sem-only"])
+        self.assertAlmostEqual(s["kw-only"], 1 / 61)
+        self.assertEqual(mod.fts_query("runs where we knocked down LMNA"), '"runs" OR "knocked" OR "down" OR "lmna"')
+        self.assertEqual(mod.fts_query('NEAR(lmna* -- "x'), '"near" OR "lmna" OR "x"')   # FTS syntax is quoted away
+
+    def test_live_hub_filter_box_searches_on_the_server(self):
+        import threading
+        import urllib.request
+        a, b, c = self._search_project()
+        mod = self._mod()
+        mod.SEARCH_DB = self.p.home / ".cache" / "lab" / "exp-search.db"
+        mod.EMBED_PYTHON = "/nonexistent/python"
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def get(path):
+                with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}{path}") as r:
+                    return r.read().decode()
+            res = json.loads(get("/proj/search?q=val_loss"))
+            self.assertEqual(res["ids"], [b])
+            self.assertEqual(res["mode"], "keyword")
+            self.assertIn("missing", res["note"])
+            self.assertIn('fetch("search?q="', get("/proj/"))
+        finally:
+            srv.shutdown(); srv.server_close()
+        static = self.p.tmp / "site"
+        self.p.run("hub", "--out", str(static))
+        self.assertIn("const LIVE = false", "".join(p.read_text() for p in static.rglob("*.html")))
 
 
 if __name__ == "__main__":
