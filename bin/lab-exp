@@ -65,8 +65,10 @@ HUB_DIRTY = Path.home() / ".config" / "lab" / "hub.dirty"
 # so it is never inside a repository. On the fleet's NFS home one index serves every box.
 SEARCH_DB = Path.home() / ".cache" / "lab" / "exp-search.db"
 # The embedding model, the one search setting. Vectors are stored per model, so changing it re-embeds
-# instead of mixing two vector spaces. litmap's own model, until a comparison says otherwise.
-EMBED_MODEL = os.environ.get("LAB_EXP_EMBED_MODEL") or "Alibaba-NLP/gte-modernbert-base"
+# instead of mixing two vector spaces. EmbeddingGemma 2 beat litmap's gte-modernbert-base on 20 ALS
+# searches with fixed answers (recall at 5: 0.75 vs 0.68, 2026-10-07); it needs sentence-transformers
+# >= 6.1 and transformers >= 5.18 in litmap's environment.
+EMBED_MODEL = os.environ.get("LAB_EXP_EMBED_MODEL") or "google/embeddinggemma-2"
 # The model runs in litmap's environment (torch + sentence-transformers), found the way the `litmap`
 # wrapper finds it; lab-exp itself stays standard-library only. LAB_EXP_EMBED_PYTHON points at
 # another interpreter (tests; trying a model litmap's environment cannot load).

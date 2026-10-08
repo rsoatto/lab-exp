@@ -191,7 +191,7 @@ each search re-reads only the experiments whose README, metrics.json or registry
 `new`, `done`, `note` and `supersede` show up on the next search. Deleting the file rebuilds it.
 A CLI search loads the model each time (about 15 s); the live hub keeps it loaded, and its filter
 box adds the server's hits to the substring match. The first search on a machine embeds every
-experiment once (about 0.5 s each on CPU).
+experiment once (about 1 s each on CPU with EmbeddingGemma 2).
 
 ## Visualizers — never rewrite a plot
 
