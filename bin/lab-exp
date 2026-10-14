@@ -2788,11 +2788,13 @@ def hub_index_html(roots, live=False, out=None, cap=None, intents="", quiet=Fals
                     try:
                         size = q.stat().st_size
                         if cap is not None and size > cap:
+                            # the report's real path: in a worktree view q runs through a temp dir
+                            # whose name changes every build, which re-published the page each time
                             n_big += 1
                             dst.write_text(f"<!doctype html><meta charset='utf-8'><title>{r['id']}</title>"
                                            f"<p style='font:15px system-ui;padding:20px'>This report is "
                                            f"{size / 1048576:.0f} MB, above the hub's {cap / 1048576:.0f} MB cap. Open it on "
-                                           f"{socket.gethostname().split('.')[0]}: <code>{q}</code></p>")
+                                           f"{socket.gethostname().split('.')[0]}: <code>{_html.escape(str(q.resolve()))}</code></p>")
                         else:
                             shutil.copyfile(q, dst)
                             n_rep += 1

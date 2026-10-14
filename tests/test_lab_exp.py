@@ -639,6 +639,19 @@ class LabExpTests(unittest.TestCase):
         self.assertFalse(any(Path(tempfile.gettempdir()).glob("lab-exp-view-*/proj/experiments")))  # views cleaned up
         self.assertNotIn(b, [d.name for d in (root / "experiments").iterdir()])                  # nothing copied in
 
+    def test_worktree_view_oversized_report_points_at_its_real_path(self):
+        a, b, c, wt = self._worktree_fixture()
+        (wt / "experiments" / b / "out" / "report.html").write_text("x" * 2_000_000)
+        mod = self._mod()
+        pages = []
+        for n in (1, 2):                                 # each build runs through a fresh temp view
+            site = self.p.tmp / f"site{n}"
+            mod.hub_index_html([self.p.root.resolve()], out=site, cap=1_000_000, quiet=True)
+            pages.append((site / "proj" / "experiments" / b / "out" / "report.html").read_text())
+        self.assertIn(str(wt / "experiments" / b / "out" / "report.html"), pages[0])
+        self.assertNotIn("lab-exp-view-", pages[0])
+        self.assertEqual(pages[0], pages[1])             # the same page every build: nothing to re-publish
+
     def test_worktree_view_live_writes_land_in_the_owning_checkout(self):
         import threading
         import urllib.request
