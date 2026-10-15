@@ -186,14 +186,15 @@ title, finding, tags, kind, status, metrics and README text) catches exact token
 gene names, metric names and "500k"; embedding similarity catches rephrasings. The embedding model
 (`EMBED_MODEL`, or `LAB_EXP_EMBED_MODEL`) runs in litmap's environment, never inside lab-exp; where
 that environment is missing, search is keyword-only and says so (`"mode": "keyword"` and a `note`
-in `--json`). The index is a cache at `~/.cache/lab/exp-search.db`, outside every repository:
-each search re-reads only the experiments whose README, metrics.json or registry row changed, so
-`new`, `done`, `note` and `supersede` show up on the next search. Deleting the file rebuilds it.
+in `--json`). The index is a cache at `~/.local/state/lab/exp-search.db` (`LAB_EXP_SEARCH_DB`),
+outside every repository and, on the fleet's NFS home, shared by every box: each search re-reads
+only the experiments whose README, metrics.json or registry row changed, so `new`, `done`, `note`
+and `supersede` show up on the next search. Deleting the file rebuilds it.
 A CLI search loads the model each time (about 15 s); the live hub keeps it loaded, and its filter
 box adds the server's hits to the substring match.
 
 Figures are searchable too. `lab-exp done` starts `lab-exp index-figures <id>` in the background
-(log: `~/.cache/lab/exp-figures.log`), which renders the experiment's figures and embeds them as
+(log: `~/.local/state/lab/exp-figures.log`), which renders the experiment's figures and embeds them as
 images in the same space as text queries: image files under `out/` (up to 40, shallowest first;
 a PDF's first page), and inside its HTML reports the embedded PNGs, inline SVGs and Vega-Lite
 charts written as JSON in `vegaEmbed()` (a spec built in JavaScript is skipped). An experiment then

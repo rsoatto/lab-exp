@@ -61,9 +61,12 @@ WANDB_ENV = Path.home() / ".config" / "lab" / "wandb.env"
 # token, not an mtime: the fleet's clocks disagree by up to an hour, and on the NFS home this
 # one file is shared by every box.
 HUB_DIRTY = Path.home() / ".config" / "lab" / "hub.dirty"
-# `lab-exp search`'s index: a cache derived from the READMEs (rebuilt by deleting it), under ~/.cache
-# so it is never inside a repository. On the fleet's NFS home one index serves every box.
-SEARCH_DB = Path.home() / ".cache" / "lab" / "exp-search.db"
+# `lab-exp search`'s index: a cache derived from the READMEs (rebuilt by deleting it), never inside a
+# repository. In ~/.local/state, not ~/.cache: on the fleet ~/.cache is a link to each box's local
+# disk, so an index there was one per box, each paying the first full embedding (10 min, an hour
+# with figures) and holding only the figures of experiments finished on that box. ~/.local/state is
+# on the NFS home, so one index serves every box. LAB_EXP_SEARCH_DB overrides.
+SEARCH_DB = Path(os.environ.get("LAB_EXP_SEARCH_DB") or Path.home() / ".local" / "state" / "lab" / "exp-search.db")
 # The embedding model, the one search setting. Vectors are stored per model, so changing it re-embeds
 # instead of mixing two vector spaces. EmbeddingGemma 2 beat litmap's gte-modernbert-base on 20 ALS
 # searches with fixed answers (recall at 5: 0.75 vs 0.68, 2026-10-07); it needs sentence-transformers
@@ -3047,7 +3050,7 @@ def cmd_index_figures(a):
 
 
 def spawn_figure_index(root, eid):
-    """Start `lab-exp index-figures <eid>` detached, logging to ~/.cache/lab/exp-figures.log: rendering
+    """Start `lab-exp index-figures <eid>` detached, logging to exp-figures.log beside the index: rendering
     and embedding take a minute or more, and `done` must return at once. LAB_EXP_NO_FIGURE_INDEX=1
     turns it off."""
     if os.environ.get("LAB_EXP_NO_FIGURE_INDEX"):

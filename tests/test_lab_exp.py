@@ -953,7 +953,7 @@ for line in sys.stdin:
         shutil.rmtree(self.p.root / "experiments" / c)                          # gone from the record too:
         self.p.run("registry", "--rebuild")                                        # its entry leaves the index
         self.assertEqual(self._search("zebrafish")["results"], [])
-        self.assertTrue((self.p.home / ".cache" / "lab" / "exp-search.db").is_file())
+        self.assertTrue((self.p.home / ".local" / "state" / "lab" / "exp-search.db").is_file())
         self.assertEqual(list(self.p.root.rglob("*.db")), [])                      # nothing lands in the repo
 
     def test_search_hybrid_finds_rephrasings_that_keywords_miss(self):
@@ -1011,7 +1011,7 @@ for line in sys.stdin:
         env = {**self.p.env, "LAB_EXP_EMBED_PYTHON": str(fake)}
         r = subprocess.run([sys.executable, str(LAB_EXP), "done", a, "--finding", "made some plots"], cwd=self.p.root,
                            env=env, capture_output=True, text=True, check=True)
-        db = self.p.home / ".cache" / "lab" / "exp-search.db"
+        db = self.p.home / ".local" / "state" / "lab" / "exp-search.db"
         rows = []
         for _ in range(100):
             if db.is_file():
@@ -1021,7 +1021,7 @@ for line in sys.stdin:
                 break
             time.sleep(0.2)
         self.assertEqual(rows, [("broken.png", 0, "cannot identify image"), ("report.html#chart1", 1, ""), ("umap.png", 1, "")],
-                         (self.p.home / ".cache" / "lab" / "exp-figures.log").read_text() if db.parent.is_dir() else "")
+                         (self.p.home / ".local" / "state" / "lab" / "exp-figures.log").read_text() if db.parent.is_dir() else "")
         res = self._search("fish", embedder=str(fake))
         self.assertEqual(res["figure_results"][0]["id"], a)                    # figures rank in their own list...
         self.assertEqual(res["figure_results"][0]["figures"][0], "umap.png")
@@ -1060,7 +1060,7 @@ for line in sys.stdin:
         import urllib.request
         a, b, c = self._search_project()
         mod = self._mod()
-        mod.SEARCH_DB = self.p.home / ".cache" / "lab" / "exp-search.db"
+        mod.SEARCH_DB = self.p.home / ".local" / "state" / "lab" / "exp-search.db"
         mod.EMBED_PYTHON = "/nonexistent/python"
         srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
