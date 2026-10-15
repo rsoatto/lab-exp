@@ -28,6 +28,10 @@ project/
 
 1. **Registry before running.** `lab-exp list` (and the lineage in `based_on`) — has this
    experiment, or its answer, already been run? Don't repeat work; fork it with `--based-on`.
+   Before `lab-exp new`, run `lab-exp search "<what you are about to test, in plain words>" --json`
+   (add `--project <name>` to stay in one project): it searches every project on the machine by
+   words and meaning. If an existing experiment already answers the question, fork it with
+   `--based-on` or cite it instead of repeating it.
 2. **INDEX + lineage before writing.** Before writing any non-trivial helper: (a) grep
    `<pkg>/INDEX.md` (everything already shared), then (b) grep your **ancestor experiments** —
    `lab-exp lineage <id>` prints the transitive `based_on` ancestry + dirs (cheap: your fork, not
