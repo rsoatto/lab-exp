@@ -396,7 +396,7 @@ class LabExpTests(unittest.TestCase):
                     return r.status, r.read().decode()
             def post(path, body):
                 req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
-                                             headers={"Content-Type": "application/json"}, method="POST")
+                                             headers={"Content-Type": "application/json", "X-Lab-Hub": "1"}, method="POST")
                 with urllib.request.urlopen(req) as r:
                     return json.loads(r.read().decode())
             self.assertEqual(get("/healthz")[0], 200)
@@ -666,7 +666,7 @@ class LabExpTests(unittest.TestCase):
         try:
             def post(path, body):
                 req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
-                                             headers={"Content-Type": "application/json"}, method="POST")
+                                             headers={"Content-Type": "application/json", "X-Lab-Hub": "1"}, method="POST")
                 with urllib.request.urlopen(req) as r:
                     return json.loads(r.read().decode())
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/proj/") as r:
@@ -1079,6 +1079,118 @@ for line in sys.stdin:
         self.p.run("hub", "--out", str(static))
         self.assertIn("const LIVE = false", "".join(p.read_text() for p in static.rglob("*.html")))
 
+
+
+FAKE_AGENT = r"""
+import json, os, re, sys
+brief = sys.argv[-1]
+open(os.environ["FAKE_AGENT_LOG"], "a").write(json.dumps({"brief": brief, "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+                                                          "cwd": os.getcwd()}) + "\n")
+if os.environ.get("FAKE_AGENT_FAIL"):
+    sys.exit(3)
+target = re.search(r"Write (experiments/\S+?\.html) and nothing else", brief)[1]
+os.makedirs(os.path.dirname(target), exist_ok=True)
+open(target, "w").write("<!doctype html><title>Report</title><meta name='viewport' content='width=device-width'><p>answer</p>")
+"""
+
+
+class WriteReportTests(unittest.TestCase):
+    """`lab-exp write-report` and the live hub's button, with a stand-in for the agent."""
+
+    def setUp(self):
+        self.p = Project()
+        self.addCleanup(self.p.cleanup)
+        self.p.init()
+        self.a = self.p.new("base")
+        self.p.run("done", self.a, "--finding", "the new loss wins: 0.91 vs 0.87 AUROC, 5 seeds")
+        agent = self.p.tmp / "agent.py"
+        agent.write_text(FAKE_AGENT)
+        self.log = self.p.tmp / "agent.log"
+        self.p.env.update(LAB_EXP_REPORT_AGENT=f"{sys.executable} {agent}", FAKE_AGENT_LOG=str(self.log),
+                          ANTHROPIC_API_KEY="sk-must-not-reach-the-agent")
+
+    def calls(self):
+        return [json.loads(l) for l in self.log.read_text().splitlines()]
+
+    def job(self):
+        return json.loads(next((self.p.home / ".cache" / "lab" / "report-jobs").glob(f"*__{self.a}.json")).read_text())
+
+    def test_writes_the_report_then_a_recap_beside_it(self):
+        out = self.p.run("write-report", self.a).stdout
+        rep = self.p.root / "experiments" / self.a / "out" / "report.html"
+        self.assertTrue(rep.is_file(), out)
+        self.assertEqual(self.job()["state"], "done")
+        c = self.calls()[0]
+        self.assertIsNone(c["api_key"])                       # the plan's login, never an API key
+        self.assertEqual(Path(c["cwd"]).resolve(), self.p.root.resolve())
+        b = c["brief"]
+        for phrase in ("coming back to it after weeks or months", "Clarity, readability and comprehensibility",
+                       'section headed "Where this fits"', "say so plainly instead of guessing",
+                       f"Write experiments/{self.a}/out/report.html and nothing else",
+                       f"`lab-exp report {self.a}`", "the new loss wins: 0.91 vs 0.87 AUROC"):
+            self.assertIn(phrase, b)
+        guide = re.search(r"house style in (\S+?\.md)", b)[1]
+        self.assertTrue(Path(guide).is_file(), guide)          # the style guide it is pointed at exists
+        before = rep.read_text()
+        self.p.run("write-report", self.a)                     # a second report never replaces the first
+        self.assertEqual(rep.read_text(), before)
+        self.assertTrue((self.p.root / "experiments" / self.a / "out" / "viz" / "recap.html").is_file())
+        self.assertIn(f"`lab-exp report {self.a} --out viz/recap.html`", self.calls()[1]["brief"])
+
+    def test_a_run_that_writes_nothing_is_a_failure(self):
+        self.p.env["FAKE_AGENT_FAIL"] = "1"
+        r = self.p.run("write-report", self.a, check=False)
+        self.assertEqual(r.returncode, 1)
+        j = self.job()
+        self.assertEqual(j["state"], "failed")
+        self.assertIn("no report was written", j["error"])
+
+    def test_live_hub_button_and_its_guard(self):
+        import threading
+        import time
+        import urllib.error
+        import urllib.request
+        spec = importlib.util.spec_from_loader("labexp_rep", importlib.machinery.SourceFileLoader("labexp_rep", str(LAB_EXP)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.REPORT_JOBS = self.p.home / ".cache" / "lab" / "report-jobs"
+        saved = {k: os.environ.get(k) for k in ("HOME", "LAB_EXP_REPORT_AGENT", "FAKE_AGENT_LOG", "ANTHROPIC_API_KEY")}
+        os.environ.update({k: self.p.env[k] for k in saved})   # the job the server starts inherits these
+        srv = mod.hub_serve([self.p.root], 0, "127.0.0.1", block=False)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            def post(path, body, headers):
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json", **headers}, method="POST")
+                with urllib.request.urlopen(req) as r:
+                    return json.loads(r.read().decode())
+            for h in ({}, {"X-Lab-Hub": "1", "Host": "evil.example:8790"}):
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    post("/proj/report", {"id": self.a}, h)
+                self.assertEqual(cm.exception.code, 403)
+            self.assertFalse(self.log.exists())                 # refused requests started nothing
+            res = post("/proj/report", {"id": self.a}, {"X-Lab-Hub": "1"})
+            self.assertIn(res["job"]["state"], ("running", "starting", "done"))
+            for _ in range(100):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/proj/report-status?id={self.a}") as r:
+                    st = json.loads(r.read().decode())
+                if st.get("state") == "done":
+                    break
+                time.sleep(0.1)
+            self.assertEqual(st["state"], "done")
+            self.assertTrue((self.p.root / "experiments" / self.a / "out" / "report.html").is_file())
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/proj/") as r:
+                page = r.read().decode()
+            self.assertIn("Report for a returning reader", page)
+            self.assertIn('"X-Lab-Hub": "1"', page)
+        finally:
+            srv.shutdown(); srv.server_close()
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 if __name__ == "__main__":
     unittest.main()

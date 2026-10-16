@@ -147,6 +147,7 @@ lab-exp new my-idea --kind training --tags arch:foo --based-on 20260701-baseline
 lab-exp run 20260720-my-idea                   # local box: runs+logs; CW cell: submits via lab-slurm
 lab-exp done 20260720-my-idea --finding "X improves Y by 12%" --metrics acc=0.91
 lab-exp supersede 20260701-old --by 20260720-my-idea --why "..."   # overridden, NOT deleted
+lab-exp write-report 20260720-my-idea          # an agent writes a plain-language report into out/ (the live hub's button too)
 lab-exp doctor                                 # drift check — run when things look off
 lab-exp registry --rebuild                     # regenerate the TSV cache from READMEs (after a pull, or when it looks stale)
 ```

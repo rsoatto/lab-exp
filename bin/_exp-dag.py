@@ -114,7 +114,7 @@ __FAVICON__
  .queued-tag { color:var(--running); font-size:.78rem; }
  #fq { width:100%; min-height:4.5rem; font:inherit; font-size:.88rem; padding:.45rem .6rem; border:1px solid var(--line);
    border-radius:7px; background:var(--bg); color:inherit; resize:vertical; }
- #fq-msg { font-size:.8rem; color:var(--mut); margin:.3rem 0 0; }
+ #fq-msg, #rep-msg { font-size:.8rem; color:var(--mut); margin:.3rem 0 0; }
  .md { border-top:1px solid var(--line); padding-top:.9rem; }
  .md h1,.md h2,.md h3 { font-size:.98rem; margin:1.1rem 0 .35rem; }
  .md h1:first-child,.md h2:first-child { margin-top:0; }
@@ -655,7 +655,7 @@ let picking = null;    // {old} while waiting for a successor click
 const hint = document.getElementById("hint");
 async function api(path, body) {
   try {
-    const r = await fetch(path, { method: "POST", headers: {"Content-Type": "application/json"},
+    const r = await fetch(path, { method: "POST", headers: {"Content-Type": "application/json", "X-Lab-Hub": "1"},
                                   body: JSON.stringify(body) });
     const j = await r.json();
     if (!j.ok) throw new Error(j.error || "request failed");
@@ -726,6 +726,13 @@ function select(id) {
       <textarea id="fq" placeholder="A question about this experiment. The lab console opens with an orchestrator ready to answer it, for you to check and start."></textarea>
       <div class="actions" style="margin-bottom:0"><button id="btn-fq">set up a follow-up orchestrator…</button></div>
       <p id="fq-msg"></p></div>` : ""}
+    ${LIVE ? `<div class="sec"><div class="head"><h3>Report for a returning reader</h3></div>
+      <p class="meta" style="margin:.2rem 0 .4rem">An agent reads this experiment's record and writes a plain-language report of
+        it, for someone coming back to it after a while: ${(n.reports || []).length
+          ? "<code>out/viz/recap.html</code>, beside the report it already has"
+          : "its <code>out/report.html</code>"}. It takes a few minutes and runs on your Claude plan.</p>
+      <div class="actions" style="margin-bottom:0"><button id="btn-rep">write a report</button></div>
+      <p id="rep-msg"></p></div>` : ""}
     <div class="sec"><div class="head"><h3>Orchestrator summary</h3></div>
       ${n.finding ? `<p style="font-size:.9rem;margin:.2rem 0">${esc(n.finding)}</p>` : `<div class="empty">no finding recorded yet</div>`}</div>
     <div class="chips">${tagsOf(n).map(t => `<span class="chip">${esc(t)}</span>`).join("")}</div>
@@ -736,6 +743,8 @@ function select(id) {
     a.addEventListener("click", ev => { ev.preventDefault(); select(a.dataset.go); }));
   const on = (bid, fn) => { const b = document.getElementById(bid); if (b) b.addEventListener("click", fn); };
   on("btn-fq", () => followUp(id, n));
+  on("btn-rep", () => writeReport(id, n));
+  if (LIVE) reportStatus(id);
   on("btn-sup",    () => { setPicking({ old: id }); select(id); });
   on("btn-cancel", () => { setPicking(null); select(id); });
   on("btn-nosucc", () => doSupersede(id, ""));
@@ -771,6 +780,35 @@ async function followUp(id, n) {
     status: n.status || "", finding: n.finding || "", q });
   window.open(CONSOLE + "?" + p.toString(), "_blank");
   msg.textContent = "Opened in the lab console: check the form there and press Start.";
+}
+// "write a report": the live server starts `lab-exp write-report` on its box (an agent writes the
+// report into out/), and this polls its job until the report is there.
+let repPoll = null;
+function repLine(id, j) {
+  const msg = document.getElementById("rep-msg"), btn = document.getElementById("btn-rep");
+  if (!msg || selected !== id) return false;
+  const busy = j.state === "running" || j.state === "starting";
+  if (btn) btn.disabled = busy;
+  const t = j.started ? new Date(j.started) : null, mins = t ? Math.max(0, Math.round((Date.now() - t) / 60000)) : 0;
+  msg.innerHTML = busy ? `Writing <code>out/${esc(j.target || "report.html")}</code>… started ${mins ? mins + " min ago" : "just now"}.`
+    : j.state === "done" ? `Written: <a href="report/${encodeURIComponent(id)}/${(j.target || "report.html").split("/").map(encodeURIComponent).join("/")}" target="_blank">open the report</a>`
+        + ((j.issues || []).filter(i => !i.startsWith("note:")).length ? ` · checks: ${esc(j.issues.filter(i => !i.startsWith("note:")).join("; "))}` : "")
+    : j.state === "failed" ? `The last attempt failed: ${esc((j.error || "").slice(0, 300))}` : "";
+  return busy;
+}
+async function reportStatus(id) {
+  clearTimeout(repPoll);
+  try {
+    const r = await fetch("report-status?id=" + encodeURIComponent(id), { cache: "no-store" });
+    const j = r.ok ? await r.json() : {};
+    if (repLine(id, j)) repPoll = setTimeout(() => reportStatus(id), 10000);
+  } catch (e) { /* the server restarted: the next selection asks again */ }
+}
+async function writeReport(id, n) {
+  const target = (n.reports || []).length ? "out/viz/recap.html" : "out/report.html";
+  if (!confirm(`Write a plain-language report of ${id} into ${target}? An agent reads its record and writes it; it takes a few minutes and runs on your Claude plan.`)) return;
+  const res = await api("report", { id });
+  if (res) { repLine(id, res.job || {}); reportStatus(id); }
 }
 
 function notesHtml(id, n) {

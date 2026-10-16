@@ -7,7 +7,10 @@ page is read on a phone as often as on a laptop.
 
 Start from **`lab-exp report <id>`**: it writes a skeleton with the house CSS and the provenance
 filled in (id, title, finding, metrics, git SHA, date, command). **`lab-exp doctor`** checks every
-report against the mechanical rules in section 6.
+report against the mechanical rules in section 6. Or let an agent write it: **`lab-exp write-report
+<id>`** (the live hub's "write a report" button runs the same thing on its box) hands Claude Code this
+guide and a brief written for a reader coming back to the experiment after a while, and it writes
+`out/report.html`, or `out/viz/recap.html` beside a report that already exists.
 
 ## 1. Who it is for
 

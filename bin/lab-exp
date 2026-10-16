@@ -2308,6 +2308,15 @@ def make_live_handler(slugmap, index_html=None, peer="", searcher=None):
                 except Exception as e:            # the filter box falls back to its substring match
                     self._send(500, json.dumps({"error": str(e)}), "application/json"); return
                 self._send(200, json.dumps(out), "application/json"); return
+            if rest == "/report-status":
+                # the last write-report job for ?id=, for the panel's progress line ({} if none)
+                eid = (parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}).get("id", [""])[0]
+                try:
+                    e = view_entry(root, eid)
+                    out = report_job(e["root"], e["id"])
+                except (Exception, SystemExit) as ex:
+                    self._send(404, json.dumps({"error": str(ex) or "no such experiment"}), "application/json"); return
+                self._send(200, json.dumps(out), "application/json"); return
             if rest.startswith("/data/"):
                 # /data/<eid>/<relpath under out/>: a CSV/TSV as a table page (?raw=1: the file itself).
                 # Same lexical confinement as /report/ below; the owner's copy via the worktree view.
@@ -2375,6 +2384,16 @@ def make_live_handler(slugmap, index_html=None, peer="", searcher=None):
             self._send(200, page, "text/html; charset=utf-8")
 
         def do_POST(self):
+            # Writes come only from the hub's own page: it sends X-Lab-Hub, which another site's page
+            # cannot without a CORS preflight this server never answers, and it addresses the server
+            # as localhost (a DNS-rebinding page arrives under its own host name). The server is
+            # private to its owner already (a 0700 socket); this keeps other tabs in the owner's
+            # browser from writing, or from spending their plan through "write a report".
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            if self.headers.get("X-Lab-Hub") != "1" or host not in ("localhost", "127.0.0.1", "::1"):
+                self._send(403, json.dumps({"ok": False, "error": "refused: not a request from the hub page"}),
+                           "application/json")
+                return
             root, prefix, rest = resolve(self.path)
             n = int(self.headers.get("Content-Length", 0))
             try:
@@ -2401,6 +2420,9 @@ def make_live_handler(slugmap, index_html=None, peer="", searcher=None):
                     e = view_entry(root, req["id"], idx)
                     txt = notes_set(e["dir"] / "README.md", req.get("text", ""))
                     out = {"ok": True, "id": req["id"], "readme": txt}
+                elif rest == "/report":
+                    e = view_entry(root, req["id"], idx)
+                    out = {"ok": True, "id": req["id"], "job": start_report_job(e["root"], e["id"])}
                 else:
                     raise ValueError(f"unknown endpoint {rest}")
             # SystemExit included: exp_dir() die()s on an unknown id, and that must fail the
@@ -3559,6 +3581,177 @@ def cmd_report(a):
     print(f"wrote {out.relative_to(root)}  -- replace every data-todo placeholder; style guide: docs/reports.md")
 
 
+# ---------------------------------------------------------------- write-report: an agent writes it
+
+# What an agent is told when it writes an experiment's report (`lab-exp write-report`, or the live
+# hub's "write a report" button). Its reader is the one reports most often fail: the person who ran
+# the experiment, back after weeks or months, who has forgotten why it was run, what its names and
+# settings mean, and what came of it.
+REPORT_BRIEF = """\
+Write the report for experiment {eid} of this lab-exp project, then stop. This is a one-shot task: \
+someone asked for it from the experiment's page in the lab hub.
+
+Where it is: the experiment's record is experiments/{eid}/README.md in this checkout ({root}), its \
+outputs are in experiments/{eid}/out/, and `lab-exp lineage {eid}` lists the experiments it was \
+built on.{status}{finding}
+
+WHO WILL READ IT. The person who ran this experiment, coming back to it after weeks or months with \
+the details gone: they no longer remember why it was run, what its names, settings and metrics \
+mean, or what came of it. Sometimes a collaborator who never knew. Write for them. Clarity, \
+readability and comprehensibility come before completeness: they should be able to read the page \
+once, top to bottom, on a phone, and come away knowing what was asked, why it mattered then, what \
+was done, what was found, how far to trust it, and what happened next, without opening the code or \
+any other page. Whatever does not serve that reader, leave out.
+
+HOW TO WRITE IT.
+- Follow the house style in {guide}: one self-contained HTML file; the answer first, in two to four \
+sentences with the number that supports it, its comparison and its n; two to five key numbers; one \
+figure or table per claim, each with a caption that says what to look at and what it shows; a short \
+method; caveats; provenance. `lab-exp report {eid}{out_flag}` writes a skeleton with the house CSS \
+and the provenance filled in: start from it and replace every placeholder.
+- Right after the answer, a short section headed "Where this fits": the question that led to this \
+experiment and why it mattered at the time (from its README and its parents' READMEs), and what came \
+of it (experiments built on it, whether it was superseded and by what, the follow-ups its README \
+lists). This is exactly what a returning reader has lost.
+- Plain language. Full sentences, one idea each, ordinary words. Define every project-specific term, \
+abbreviation and metric in words where it first appears ("validation Pearson per gene", never \
+val_gene_pearson). Keep variable names, flags, file names and experiment ids out of the prose unless \
+the reader needs one to act, and then put it in code font with a few words saying what it is. \
+Headings are questions or conclusions, never names from the code.
+- Every number comes from the experiment's own record: its README, out/metrics.json, \
+out/run-meta.json and the other files in out/. Give each its comparison and its n. Do not rerun the \
+experiment or compute new results; you may re-plot what its outputs already hold. If something the \
+reader would want is not in the record, say so plainly instead of guessing. Keep what was observed \
+apart from how it is interpreted, and say what did not work or was ruled out when the record shows it.
+- About two phone screens. Anything longer belongs in a secondary view under out/viz/, or nowhere.
+
+WHERE IT GOES. Write {target} and nothing else: no edits to the README, the code or any other \
+experiment, and no commits. Put any throwaway plotting script in a temporary directory outside the \
+repository. When the file is written, run `lab-exp doctor`, fix whatever it reports about this file, \
+and check that no data-todo placeholder is left.
+
+Finish with one short paragraph: the file you wrote, its one-sentence answer, and anything the reader \
+would want that the record does not contain.
+"""
+REPORT_GUIDE = Path(__file__).resolve().parent.parent / "docs" / "reports.md"
+REPORT_JOBS = Path.home() / ".cache" / "lab" / "report-jobs"      # job state + agent log, per experiment
+REPORT_AGENT = "claude -p --permission-mode auto"     # LAB_EXP_REPORT_AGENT overrides; the brief is appended
+REPORT_TIMEOUT_S = int(os.environ.get("LAB_EXP_REPORT_TIMEOUT", "3600"))
+
+
+def report_job_path(root, eid):
+    slug = hub_slug(load_cfg(root)["project"].get("name") or root.name)
+    return REPORT_JOBS / f"{slug}__{eid}.json"
+
+
+def _report_lock(jp):
+    """An exclusive, non-blocking lock held by the writing process for its whole run (None if
+    another holds it). A box that reboots, or a killed job, releases it."""
+    jp.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(jp.with_suffix(".lock"), "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
+def report_job(root, eid):
+    """The last write-report job for this experiment, {} if none. One recorded as running whose
+    lock nobody holds has died (killed, or the box rebooted) and reads as failed."""
+    jp = report_job_path(root, eid)
+    try:
+        j = json.loads(jp.read_text())
+    except (OSError, ValueError):
+        return {}
+    if j.get("state") == "running" and j.get("host") == socket.gethostname().split(".")[0]:
+        fh = _report_lock(jp)
+        if fh:
+            fh.close()
+            j.update(state="failed", error="the job stopped before finishing (its process is gone)")
+    return j
+
+
+def report_target(d):
+    """(path under out/, extra `lab-exp report` flag): the primary report, or a recap beside it."""
+    return ("viz/recap.html", " --out viz/recap.html") if (d / "out" / "report.html").exists() else ("report.html", "")
+
+
+def cmd_write_report(a):
+    """An agent (Claude Code by default, under its own login: never an API key) reads the
+    experiment's record and writes a plain-language report of it into out/, following REPORT_BRIEF.
+    The live hub's button runs this, detached, on the hub's box."""
+    root = find_root(a.root)
+    d = exp_dir(root, a.id)
+    eid = d.name
+    jp = report_job_path(root, eid)
+    lock = _report_lock(jp)
+    if lock is None:
+        die(f"a report for {eid} is already being written (log: {jp.with_suffix('.log')})")
+    fm = read_front(d / "README.md")
+    rel, out_flag = report_target(d)
+    target = d / "out" / rel
+    brief = REPORT_BRIEF.format(
+        eid=eid, root=root, guide=REPORT_GUIDE, out_flag=out_flag, target=target.relative_to(root),
+        status=f" Its status is {fm['status']}." if fm.get("status") else "",
+        finding=f" Its recorded finding: {fm['finding']}" if fm.get("finding") else "")
+    agent = shlex.split(os.environ.get("LAB_EXP_REPORT_AGENT") or REPORT_AGENT)
+    model = os.environ.get("LAB_EXP_REPORT_MODEL", "")
+    argv = agent + (["--model", model] if model else []) + [brief]
+    log = jp.with_suffix(".log")
+    started = time.time()
+    job = {"id": eid, "state": "running", "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           "host": socket.gethostname().split(".")[0], "pid": os.getpid(), "target": rel, "log": str(log)}
+    jp.write_text(json.dumps(job, indent=1))
+    print(f"writing {target.relative_to(root)} with {agent[0]} (log: {log})", flush=True)
+    env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    try:
+        with open(log, "w") as lf:
+            rc = subprocess.run(argv, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=lf,
+                                stderr=subprocess.STDOUT, timeout=REPORT_TIMEOUT_S).returncode
+    except subprocess.TimeoutExpired:
+        rc = f"timed out after {REPORT_TIMEOUT_S // 60} min"
+    except OSError as e:
+        rc = f"could not start {agent[0]}: {e}"
+    wrote = target.is_file() and target.stat().st_mtime >= started - 1
+    job.update(finished=datetime.now(timezone.utc).isoformat(timespec="seconds"), rc=rc)
+    if wrote:
+        job.update(state="done", issues=report_issues(target))
+        hub_touch()
+    else:
+        try:
+            tail = log.read_text(errors="replace").strip()[-400:]
+        except OSError:
+            tail = ""
+        job.update(state="failed", error=f"no report was written (agent: {rc}). {tail}".strip())
+    jp.write_text(json.dumps(job, indent=1))
+    lock.close()
+    print(f"{'wrote' if wrote else 'FAILED:'} {target.relative_to(root) if wrote else job['error']}")
+    for i in job.get("issues") or []:
+        print("  " + i)
+    if not wrote:
+        sys.exit(1)             # main() ignores return values: commands fail by exit status
+
+
+def start_report_job(root, eid):
+    """The live hub's button: start `lab-exp write-report` detached (it outlives the request) and
+    return its job record once it is running, or the running one if there already is one."""
+    cur = report_job(root, eid)
+    if cur.get("state") == "running":
+        return cur
+    before = cur.get("started")
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--root", str(root), "write-report", eid],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    for _ in range(50):
+        j = report_job(root, eid)
+        if j.get("started") != before and j.get("state"):
+            return j
+        time.sleep(0.1)
+    return {"id": eid, "state": "starting"}
+
+
 REPORT_CAP_MB = 25          # the hub's default --max-mb: above it, the hub shows a pointer page
 _REL_ASSET = re.compile(r"(?:src|href)\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
@@ -4378,6 +4571,10 @@ def main():
     s.add_argument("--out", default="", metavar="REL", help="path under out/ (default report.html; e.g. viz/ablation.html)")
     s.add_argument("--force", action="store_true", help="overwrite an existing file")
 
+    s = sub.add_parser("write-report", help="an agent writes a plain-language report of an experiment into out/ "
+                       "(report.html, or viz/recap.html beside an existing one); the live hub's button runs it")
+    s.add_argument("id")
+
     s = sub.add_parser("intents", help="apply queued hub marks (a 'lab-exp intents v1' document, e.g. an issue body)")
     s.add_argument("file", help="path, or - for stdin")
     s.add_argument("--dry-run", action="store_true")
@@ -4398,7 +4595,7 @@ def main():
      "materialize": cmd_materialize, "adopt": cmd_adopt, "rename": cmd_rename,
      "lineage": cmd_lineage, "graph": cmd_graph, "dag": cmd_dag,
      "list": cmd_list, "search": cmd_search, "index-figures": cmd_index_figures, "viz": cmd_viz, "serve": cmd_serve,
-     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents, "report": cmd_report,
+     "index": cmd_index, "doctor": cmd_doctor, "projects": cmd_projects, "registry": cmd_registry, "hub": cmd_hub, "intents": cmd_intents, "report": cmd_report, "write-report": cmd_write_report,
      "retire-worktree": cmd_retire_worktree,
      "_stamp-hw": cmd_stamp_hw}[a.cmd](a)
 
